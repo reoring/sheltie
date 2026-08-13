@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.devbox/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.poc/

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.17.5/.schema/devbox.schema.json",
+  "packages": [
+    "rustc@1.96.1",
+    "cargo@1.96.1",
+    "rustfmt@1.96.1",
+    "clippy@1.96.1",
+    "cargo-nextest@0.9.143",
+    "just",
+    "zig@0.15.2",
+    "bun@1.3.13",
+    "python@3.13",
+    "pkg-config",
+    "cmake",
+    "ninja"
+  ],
+  "env": {
+    "RUST_BACKTRACE": "1"
+  },
+  "shell": {
+    "scripts": {
+      "check-env": [
+        "rustc --version",
+        "cargo --version",
+        "cargo clippy --version",
+        "rustfmt --version",
+        "cargo nextest --version",
+        "just --version",
+        "zig version",
+        "bun --version",
+        "python --version"
+      ]
+    }
+  }
+}
