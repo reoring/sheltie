@@ -32,7 +32,9 @@ class FakeCancellationHerdr implements CancellationHerdrControl {
   readonly calls: string[] = [];
   readonly agents = new Map<string, AgentInfo>();
   readonly stubborn = new Set<string>();
+  pingCalls = 0;
   ping(): Promise<PongResult> {
+    this.pingCalls += 1;
     return Promise.resolve({
       type: "pong",
       version: "0.8.0",
@@ -257,6 +259,25 @@ describe("safe cancellation", () => {
     expect(status.steps.every((step) => step.status === "cancelled")).toBe(true);
     expect(existsSync(join(fixture.rootPath, "dirty.txt"))).toBe(true);
     expect(existsSync(join(fixture.childPath, "dirty.txt"))).toBe(true);
+    fixture.store.close();
+  });
+
+  test("leaves a cleaned tree untouched without contacting agents", async () => {
+    const fixture = createCancellationFixture();
+    fixture.store.setTreeStatus("tree-cancel", "cleaned");
+    const herdr = new FakeCancellationHerdr();
+    const controller = new CancellationController(fixture.store, herdr, {
+      graceMs: 1,
+      forceWaitMs: 1,
+    });
+    const before = controller.status();
+
+    expect(await controller.convergeOnce()).toEqual(before);
+    expect(await controller.cancelRun()).toEqual(before);
+    expect(fixture.store.requestCancellation()).toEqual(before.tree);
+    expect(controller.status()).toEqual(before);
+    expect(herdr.pingCalls).toBe(0);
+    expect(herdr.calls).toEqual([]);
     fixture.store.close();
   });
 });

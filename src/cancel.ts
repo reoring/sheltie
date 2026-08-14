@@ -70,6 +70,7 @@ export class CancellationController {
   }
 
   async cancelRun(): Promise<RealRunStatus> {
+    if (this.store.getOnlyTree().status === "cleaned") return this.status();
     const pong = await this.herdr.ping();
     if (pong.capabilities?.agent_control !== true) {
       throw new Error("Herdr runtime does not advertise agent_control capability");
@@ -80,7 +81,7 @@ export class CancellationController {
 
   async convergeOnce(): Promise<RealRunStatus> {
     let tree = this.store.getOnlyTree();
-    if (tree.status === "completed" || tree.status === "failed" || tree.status === "cancelled") {
+    if (tree.status === "completed" || tree.status === "failed" || tree.status === "cancelled" || tree.status === "cleaned") {
       return this.status();
     }
     if (!CANCELLATION_TREE_STATES.has(tree.status)) this.store.requestCancellation();

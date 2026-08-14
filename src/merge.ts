@@ -9,6 +9,7 @@ import {
   runGit,
 } from "./git.ts";
 import { operationIdForRequest, requestHash } from "./ids.ts";
+import { getManifestRole, parseResolvedManifest } from "./manifest.ts";
 
 export class MergeBlockedError extends Error {
   constructor(message: string) {
@@ -71,9 +72,22 @@ export class MergeController {
     if (tree.status !== "active") {
       throw new Error(`tree ${tree.treeId} is not active (${tree.status})`);
     }
+    if (tree.manifestDigest !== null) {
+      if (parent.roleName === null) throw new Error(`manifest parent ${parent.nodeId} has no role identity`);
+      const manifestRecord = this.store.getManifest(tree.manifestDigest);
+      if (manifestRecord === null) throw new Error(`tree ${tree.treeId} manifest ${tree.manifestDigest} is missing`);
+      const manifest = parseResolvedManifest(manifestRecord.resolved);
+      const parentRole = getManifestRole(manifest, parent.roleName);
+      if (!parentRole.capabilities.mergeChildren) {
+        throw new Error(`role ${parentRole.name} is not authorized to merge child branches`);
+      }
+    }
     const child = this.store.getNode(input.childNodeId);
     if (child.treeId !== parent.treeId || child.parentNodeId !== parent.nodeId) {
       throw new Error(`node ${child.nodeId} is not a direct child of ${parent.nodeId}`);
+    }
+    if (child.placement !== "workspace") {
+      throw new Error(`tab child ${child.nodeId} shares its parent worktree and must not be merged`);
     }
     if (child.lifecycleStatus !== "completed") {
       throw new Error(`child ${child.nodeId} is not completed`);

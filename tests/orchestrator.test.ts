@@ -13,7 +13,7 @@ import type {
   WorkspaceInfo,
   WorktreeInfo,
 } from "../src/herdr-client.ts";
-import { agentNameForNode } from "../src/ids.ts";
+import { agentNameForNode, operationIdForRequest, requestHash } from "../src/ids.ts";
 import { type HerdrControl, SheltieOrchestrator } from "../src/orchestrator.ts";
 
 const roots: string[] = [];
@@ -22,15 +22,26 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function workspace(workspaceId: string, checkoutPath?: string): WorkspaceInfo {
+function workspace(
+  workspaceId: string,
+  checkoutPath?: string,
+  label = workspaceId,
+  isLinkedWorktree = true,
+): WorkspaceInfo {
   return {
     workspace_id: workspaceId,
-    label: workspaceId,
+    label,
     focused: false,
     active_tab_id: `${workspaceId}:t1`,
     ...(checkoutPath === undefined
       ? {}
-      : { worktree: { repo_root: "/tmp/repo", checkout_path: checkoutPath, is_linked_worktree: true } }),
+      : {
+          worktree: {
+            repo_root: checkoutPath,
+            checkout_path: checkoutPath,
+            is_linked_worktree: isLinkedWorktree,
+          },
+        }),
   };
 }
 
@@ -61,11 +72,14 @@ function agent(nodeId: string, workspaceId: string, paneId: string): AgentInfo {
 
 class FakeHerdr implements HerdrControl {
   readonly worktreeCreates: Record<string, unknown>[] = [];
-  readonly prompts: Record<string, unknown>[] = [];
+  readonly prompts: Array<{ target: string; text: string; client_operation_id?: string }> = [];
   readonly acceptedPromptOperations = new Set<string>();
   promptWrites = 0;
   agentStartCalls = 0;
   agentStartBusyAttempts = 0;
+  omitAgentInstance = false;
+  workspaceCreateCalls = 0;
+  readonly workspaceCreates: Record<string, unknown>[] = [];
   snapshotValue: SessionSnapshot = {
     version: "0.8.0",
     protocol: 20,
@@ -84,6 +98,32 @@ class FakeHerdr implements HerdrControl {
     return Promise.resolve(this.snapshotValue);
   }
 
+  workspaceCreate(params: {
+    cwd: string;
+    focus?: boolean;
+    label?: string;
+    env?: Record<string, string>;
+  }): Promise<{ type: "workspace_created"; workspace: WorkspaceInfo; tab: TabInfo; root_pane: PaneInfo }> {
+    this.workspaceCreateCalls += 1;
+    this.workspaceCreates.push(params);
+    const workspaceId = `w-root-${this.workspaceCreateCalls}`;
+    const createdWorkspace = workspace(workspaceId, params.cwd, params.label, false);
+    const createdTab = { workspace_id: workspaceId, tab_id: `${workspaceId}:t1` };
+    const rootPane = pane(workspaceId, `${workspaceId}:p1`);
+    this.snapshotValue = {
+      ...this.snapshotValue,
+      workspaces: [...this.snapshotValue.workspaces, createdWorkspace],
+      tabs: [...this.snapshotValue.tabs, createdTab],
+      panes: [...this.snapshotValue.panes, rootPane],
+    };
+    return Promise.resolve({
+      type: "workspace_created",
+      workspace: createdWorkspace,
+      tab: createdTab,
+      root_pane: rootPane,
+    });
+  }
+
   worktreeList(): Promise<{
     type: "worktree_list";
     source: { repo_root: string; source_workspace_id?: string };
@@ -97,9 +137,9 @@ class FakeHerdr implements HerdrControl {
   }
 
   worktreeCreate(params: {
-    workspace_id: string;
+    workspace_id?: string;
+    cwd?: string;
     branch: string;
-    base?: string;
     path?: string;
     label?: string;
     focus?: boolean;
@@ -130,6 +170,19 @@ class FakeHerdr implements HerdrControl {
     });
   }
 
+  tabCreate(): Promise<never> {
+    return Promise.reject(new Error("tabCreate was not expected"));
+  }
+
+  tabRename(params: { tab_id: string; label: string }): Promise<{ type: "tab_info"; tab: TabInfo }> {
+    const tab = this.snapshotValue.tabs.find((candidate) => candidate.tab_id === params.tab_id);
+    if (tab !== undefined) tab.label = params.label;
+    return Promise.resolve({
+      type: "tab_info",
+      tab: tab ?? { tab_id: params.tab_id, workspace_id: params.tab_id.split(":")[0] ?? "w2", label: params.label },
+    });
+  }
+
   async agentStart(params: { name: string; kind: string; pane_id: string }): Promise<{
     type: "agent_started";
     agent: AgentInfo;
@@ -140,9 +193,11 @@ class FakeHerdr implements HerdrControl {
       this.agentStartBusyAttempts -= 1;
       throw new HerdrApiError("agent_pane_busy", "pane shell is not ready", "test-request");
     }
+    const started = agent("node-root", "w2", params.pane_id);
+    if (this.omitAgentInstance) delete started.agent_instance_id;
     return {
       type: "agent_started",
-      agent: agent("node-root", "w2", params.pane_id),
+      agent: started,
       argv: [params.kind],
     };
   }
@@ -151,7 +206,9 @@ class FakeHerdr implements HerdrControl {
     const found = this.snapshotValue.agents.find(
       (candidate) => candidate.name === target || candidate.pane_id === target,
     );
-    return Promise.resolve({ type: "agent_info", agent: found ?? agent("node-root", "w2", "w2:p1") });
+    const current = found ?? agent("node-root", "w2", "w2:p1");
+    if (this.omitAgentInstance) delete current.agent_instance_id;
+    return Promise.resolve({ type: "agent_info", agent: current });
   }
 
   agentPrompt(params: {
@@ -191,7 +248,7 @@ function seedStore(): { store: SheltieStore; root: string } {
     treeId: "tree-1",
     runId: "run-1",
     repoRoot: "/tmp/repo",
-    repoSourceWorkspaceId: "w1",
+    repoSourceWorkspaceId: null,
     herdrSocketPath: join(root, "herdr.sock"),
     herdrVersion: "0.8.0",
     herdrProtocol: 19,
@@ -214,8 +271,39 @@ function seedStore(): { store: SheltieStore; root: string } {
   return { store, root };
 }
 
+function seedRootWorkspaceStore(): { store: SheltieStore; root: string } {
+  const root = mkdtempSync(join(tmpdir(), "sheltie-root-workspace-"));
+  roots.push(root);
+  const store = new SheltieStore(join(root, "state.sqlite"));
+  store.createTree({
+    treeId: "tree-root-workspace",
+    runId: "run-root-workspace",
+    repoRoot: "/tmp/repo",
+    repoSourceWorkspaceId: null,
+    herdrSocketPath: join(root, "herdr.sock"),
+    herdrVersion: "0.8.0",
+    herdrProtocol: 20,
+    baseCommit: "a".repeat(40),
+    worktreeRoot: join(root, "worktrees"),
+    status: "active",
+    rootTaskContract: "create the root result",
+  });
+  store.reserveNode({
+    nodeId: "node-root-workspace",
+    treeId: "tree-root-workspace",
+    parentNodeId: null,
+    name: "root",
+    depth: 0,
+    branch: "sheltie/root-workspace",
+    baseCommit: "a".repeat(40),
+    worktreePath: "/tmp/repo",
+    taskContract: "create the root result",
+  });
+  return { store, root };
+}
+
 describe("node provisioning", () => {
-  test("uses the repository source workspace and waits for a newly-created pane shell", async () => {
+  test("uses the repository cwd without a source workspace and waits for a newly-created pane shell", async () => {
     const { store } = seedStore();
     const herdr = new FakeHerdr();
     herdr.agentStartBusyAttempts = 2;
@@ -226,7 +314,7 @@ describe("node provisioning", () => {
     const provisioned = await orchestrator.provisionNode("node-root");
 
     expect(herdr.worktreeCreates).toEqual([
-      expect.objectContaining({ workspace_id: "w1", branch: "sheltie/root", base: "a".repeat(40) }),
+      expect.objectContaining({ cwd: "/tmp/repo", branch: "sheltie/root", base: "a".repeat(40) }),
     ]);
     expect(herdr.agentStartCalls).toBe(3);
     expect(provisioned).toMatchObject({
@@ -235,6 +323,109 @@ describe("node provisioning", () => {
       agentName: agentNameForNode("node-root"),
       lifecycleStatus: "agent_ready",
     });
+    store.close();
+  });
+
+  test("refuses to bind an Agent response without a protocol-20 launch instance", async () => {
+    const { store } = seedStore();
+    const herdr = new FakeHerdr();
+    herdr.omitAgentInstance = true;
+    const orchestrator = new SheltieOrchestrator(store, herdr, {
+      sheltieExecutable: "/workspace/sheltie/dist/sheltie",
+    });
+
+    await expect(orchestrator.provisionNode("node-root")).rejects.toThrow("per-launch instance identity");
+    expect(store.getNode("node-root").agentInstanceId).toBeNull();
+    store.close();
+  });
+});
+
+describe("root workspace identity", () => {
+  test("rebinds one response-lost root workspace by its deterministic node label", async () => {
+    const { store, root } = seedRootWorkspaceStore();
+    const node = store.getNode("node-root-workspace");
+    const herdr = new FakeHerdr();
+    herdr.snapshotValue = {
+      version: "0.8.0",
+      protocol: 20,
+      workspaces: [workspace("w-foreign", "/tmp/repo", "root", false)],
+      tabs: [{ workspace_id: "w-foreign", tab_id: "w-foreign:t1", label: "coord" }],
+      panes: [pane("w-foreign", "w-foreign:p1")],
+      agents: [],
+    };
+    let failpointArmed = true;
+    const first = new SheltieOrchestrator(store, herdr, {
+      sheltieExecutable: join(root, "sheltie"),
+      failpoint: (name) => {
+        if (name === "before_worktree_response_persist" && failpointArmed) {
+          failpointArmed = false;
+          throw new Error("workspace response lost");
+        }
+      },
+    });
+
+    await expect(first.provisionNode(node.nodeId)).rejects.toThrow("workspace response lost");
+    expect(herdr.workspaceCreates).toEqual([
+      expect.objectContaining({ cwd: "/tmp/repo", label: node.nodeId }),
+    ]);
+    expect(store.getNode(node.nodeId).workspaceId).toBeNull();
+
+    const restored = new SheltieOrchestrator(store, herdr, { sheltieExecutable: join(root, "sheltie") });
+    const rebound = await restored.reconcileNode(node.nodeId);
+    const workspaceOperationId = operationIdForRequest(node.treeId, "workspace_create", node.nodeId);
+
+    expect(rebound).toMatchObject({
+      workspaceId: "w-root-1",
+      tabId: "w-root-1:t1",
+      paneId: "w-root-1:p1",
+    });
+    expect(store.getTree(node.treeId).repoSourceWorkspaceId).toBe("w-root-1");
+    expect(store.getOperation(workspaceOperationId).status).toBe("completed");
+    expect(herdr.workspaceCreateCalls).toBe(1);
+    expect(herdr.snapshotValue.workspaces.map((candidate) => candidate.workspace_id)).toEqual([
+      "w-foreign",
+      "w-root-1",
+    ]);
+    store.close();
+  });
+
+  test("does not adopt a foreign same-name root workspace after workspace response loss", async () => {
+    const { store, root } = seedRootWorkspaceStore();
+    const node = store.getNode("node-root-workspace");
+    const operationId = operationIdForRequest(node.treeId, "workspace_create", node.nodeId);
+    const request = { cwd: "/tmp/repo", label: node.nodeId };
+    store.reserveOperation({
+      operationId,
+      treeId: node.treeId,
+      nodeId: node.nodeId,
+      kind: "workspace_create",
+      requestKey: node.nodeId,
+      requestHash: requestHash(request),
+      request,
+    });
+    store.setOperationStatus(operationId, "delivery_unknown", { lastError: "workspace response lost" });
+    const herdr = new FakeHerdr();
+    herdr.snapshotValue = {
+      version: "0.8.0",
+      protocol: 20,
+      workspaces: [workspace("w-foreign", "/tmp/repo", "root", false)],
+      tabs: [{ workspace_id: "w-foreign", tab_id: "w-foreign:t1", label: "coord" }],
+      panes: [pane("w-foreign", "w-foreign:p1")],
+      agents: [],
+    };
+    const orchestrator = new SheltieOrchestrator(store, herdr, {
+      sheltieExecutable: join(root, "sheltie"),
+    });
+
+    await expect(orchestrator.reconcileNode(node.nodeId)).rejects.toThrow(
+      "expected one repository workspace; found 0",
+    );
+
+    expect(store.getNode(node.nodeId).workspaceId).toBeNull();
+    expect(store.getTree(node.treeId).repoSourceWorkspaceId).toBeNull();
+    expect(store.getOperation(operationId).status).toBe("delivery_unknown");
+    expect(herdr.workspaceCreateCalls).toBe(0);
+    expect(herdr.snapshotValue.workspaces.map((candidate) => candidate.workspace_id)).toEqual(["w-foreign"]);
     store.close();
   });
 });
@@ -341,8 +532,54 @@ describe("prompt operation idempotency", () => {
     expect(herdr.prompts[0]?.text).toContain("--wait-ms 180000");
     expect(herdr.prompts[0]?.text).toContain("merge --db");
     expect(herdr.prompts[0]?.text).toContain("--child-node <child-node-id>");
+    const prompt = herdr.prompts[0]?.text ?? "";
+    expect(prompt.match(/--caller-pane "\$HERDR_PANE_ID"/g)).toHaveLength(8);
+    expect(prompt).not.toContain("--agent-session");
+    expect(prompt).not.toContain("--parent-pane");
     expect(store.claimStep(first.operationId, "session-node-root")).toEqual({ outcome: "claimed" });
     expect(store.claimStep(first.operationId, "other-session")).toEqual({ outcome: "conflict" });
+    store.close();
+  });
+
+  test("orders a non-root final result after step completion and node finish", async () => {
+    const { store, root } = seedStore();
+    store.reserveNode({
+      nodeId: "node-child",
+      treeId: "tree-1",
+      parentNodeId: "node-root",
+      name: "child",
+      depth: 1,
+      placement: "tab",
+      spawnPolicy: "none",
+      branch: "sheltie/root",
+      baseCommit: "a".repeat(40),
+      worktreePath: join(root, "worktrees/root"),
+      taskContract: "report findings",
+    });
+    store.bindWorktree("node-child", { workspaceId: "w2", tabId: "w2:t2", paneId: "w2:p2" });
+    store.bindAgent("node-child", {
+      agentName: agentNameForNode("node-child"),
+      terminalId: "terminal-node-child",
+      agentInstanceId: "instance-node-child",
+    });
+    const herdr = new FakeHerdr();
+    const orchestrator = new SheltieOrchestrator(store, herdr, {
+      sheltieExecutable: join(root, "sheltie"),
+    });
+
+    await orchestrator.dispatchStep("node-child", "initial", "report findings");
+
+    const prompt = herdr.prompts[0]?.text ?? "";
+    expect(prompt).toContain("--kind progress");
+    expect(prompt).toContain("progress/message != completion");
+    expect(prompt).toContain("only after its result-kind message arrives from a completed sender");
+    expect(prompt).not.toContain("Send a concrete result to the parent before finishing:");
+    const stepCompleteIndex = prompt.indexOf("step complete --db");
+    const nodeFinishIndex = prompt.indexOf("node finish --db");
+    const resultIndex = prompt.indexOf("--kind result");
+    expect(stepCompleteIndex).toBeGreaterThan(-1);
+    expect(nodeFinishIndex).toBeGreaterThan(stepCompleteIndex);
+    expect(resultIndex).toBeGreaterThan(nodeFinishIndex);
     store.close();
   });
 
