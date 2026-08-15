@@ -1,5 +1,5 @@
 import { mkdirSync, realpathSync } from "node:fs";
-import type { TreeRecord } from "./db.ts";
+import type { MessageRecord, NodeRecord, OperationRecord, StepExecutionRecord, TreeRecord } from "./db.ts";
 import { SheltieStore } from "./db.ts";
 import { CommandError, isCleanWorktree, resolveCommit, runGit } from "./git.ts";
 import type { PongResult } from "./herdr-client.ts";
@@ -31,12 +31,18 @@ export interface StartRunInput {
   herdrSocketPath: string;
 }
 
-export interface RealRunStatus {
+/**
+ * Raw controller state used only inside trusted lifecycle controllers.
+ *
+ * It contains task, path, runtime identity, and message details, so CLI and
+ * other public serializers must project an ObservationSnapshot instead.
+ */
+export interface InternalRunStatus {
   tree: TreeRecord;
-  nodes: ReturnType<SheltieStore["listNodes"]>;
-  operations: ReturnType<SheltieStore["listUnresolvedOperations"]>;
-  steps: ReturnType<SheltieStore["listSteps"]>;
-  messages: ReturnType<SheltieStore["listMessages"]>;
+  nodes: NodeRecord[];
+  operations: OperationRecord[];
+  steps: StepExecutionRecord[];
+  messages: MessageRecord[];
 }
 
 function runSuffix(runId: string): string {
@@ -138,7 +144,7 @@ export class RealRunController {
     return tree;
   }
 
-  async convergeOnce(): Promise<RealRunStatus> {
+  async convergeOnce(): Promise<InternalRunStatus> {
     const current = this.store.getOnlyTree();
     if (["cancel_requested", "cancelling", "cancelled", "cancel_blocked", "cleaned"].includes(current.status)) {
       return this.status();
@@ -174,7 +180,7 @@ export class RealRunController {
     return { ...this.status(), tree };
   }
 
-  status(): RealRunStatus {
+  status(): InternalRunStatus {
     const tree = this.store.getOnlyTree();
     return {
       tree,

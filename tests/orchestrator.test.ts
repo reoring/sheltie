@@ -308,7 +308,7 @@ describe("node provisioning", () => {
     const herdr = new FakeHerdr();
     herdr.agentStartBusyAttempts = 2;
     const orchestrator = new SheltieOrchestrator(store, herdr, {
-      sheltieExecutable: "/workspace/sheltie/dist/sheltie",
+      sheltieExecutable: "/opt/sheltie/bin/sheltie",
     });
 
     const provisioned = await orchestrator.provisionNode("node-root");
@@ -331,7 +331,7 @@ describe("node provisioning", () => {
     const herdr = new FakeHerdr();
     herdr.omitAgentInstance = true;
     const orchestrator = new SheltieOrchestrator(store, herdr, {
-      sheltieExecutable: "/workspace/sheltie/dist/sheltie",
+      sheltieExecutable: "/opt/sheltie/bin/sheltie",
     });
 
     await expect(orchestrator.provisionNode("node-root")).rejects.toThrow("per-launch instance identity");

@@ -1,6 +1,17 @@
 {
   "name": "sheltie",
   "version": "0.1.0",
+  "description": "Manifest-declared local orchestration for OMP Agents in Herdr workspaces.",
+  "license": "Apache-2.0",
+  "packageManager": "bun@1.3.13",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/reoring/sheltie.git"
+  },
+  "bugs": {
+    "url": "https://github.com/reoring/sheltie/issues"
+  },
+  "homepage": "https://github.com/reoring/sheltie#readme",
   "private": true,
   "type": "module",
   "bin": {

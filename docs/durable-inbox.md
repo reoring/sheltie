@@ -255,9 +255,9 @@ The public `ObservationSnapshot` does not expose message bodies, message IDs, re
 
 The Cockpit consumes that allowlisted snapshot. It does not open SQLite directly and cannot send or receive messages.
 
-## Verified live flow
+## Development integration evidence
 
-The `live-completion-race-fix-20260814` local run verified:
+A reproducible development integration flow verified this completion ordering:
 
 ```text
 researcher result → team
@@ -265,7 +265,7 @@ reviewer result   → team
 team result       → root
 ```
 
-All three messages were `kind=result`, and every sender was completed before insertion. The run completed four nodes with zero unresolved operations in about 1 minute 25 seconds. The prior dirty-worktree, unfinished-child, and asymmetric-messaging rejection loop did not recur.
+All three messages were `kind=result`, and every sender was completed before insertion. The flow completed four nodes with zero unresolved operations. Dirty-worktree, unfinished-child, and asymmetric-messaging rejection loops did not recur during the successful flow. These observations describe development behavior only.
 
 ## Current limitations
 

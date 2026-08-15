@@ -1,9 +1,9 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { AgentCallerAuthenticator, type AgentCallerHerdrControl } from "../src/agent-caller.ts";
 import { runCli } from "../src/cli.ts";
 import { SheltieStore } from "../src/db.ts";
@@ -269,6 +269,25 @@ describe("AgentCallerAuthenticator", () => {
     expect(herdr.calls).toBe(0);
     fixture.store.close();
   });
+  test("rejects an unsafe database parent before reading identity or contacting Herdr", async () => {
+    const fixture = createFixture();
+    const herdr = new FakeCallerHerdr(agent());
+    chmodSync(dirname(fixture.databasePath), 0o755);
+    try {
+      await expect(
+        new AgentCallerAuthenticator(() => herdr).authenticate({
+          databasePath: fixture.databasePath,
+          callerPaneId: "workspace-root:pane-root",
+        }),
+      ).rejects.toThrow("grants group or other access");
+      expect(herdr.calls).toBe(0);
+      expect(fixture.store.getNode("node-root").lifecycleStatus).toBe("agent_ready");
+    } finally {
+      chmodSync(dirname(fixture.databasePath), 0o700);
+      fixture.store.close();
+    }
+  });
+
 });
 
 describe("agent-facing CLI authentication", () => {

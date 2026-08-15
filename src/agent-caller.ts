@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, statSync } from "node:fs";
 import { SheltieStore } from "./db.ts";
 import { HerdrApiError, HerdrClient, type AgentInfo } from "./herdr-client.ts";
+import { assertPrivateStateParentForDatabase } from "./state-security.ts";
 
 const REQUIRED_IDENTITY_COLUMNS = {
   nodes: [
@@ -92,11 +93,12 @@ function readStoredIdentity(input: {
   callerPaneId: string;
   expectedNodeId?: string;
 }): AuthenticatedAgentCaller {
-  if (!existsSync(input.databasePath) || !statSync(input.databasePath).isFile()) {
-    fail(`state database ${input.databasePath} is missing`);
+  const databasePath = assertPrivateStateParentForDatabase(input.databasePath);
+  if (!existsSync(databasePath) || !statSync(databasePath).isFile()) {
+    fail("state database is missing");
   }
 
-  const database = new Database(input.databasePath, { readonly: true, strict: true });
+  const database = new Database(databasePath, { readonly: true, strict: true });
   let transactionOpen = false;
   try {
     database.exec("PRAGMA query_only = 1");

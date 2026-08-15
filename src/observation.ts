@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { requestHash } from "./ids.ts";
+import { assertPrivateStateDirectory } from "./state-security.ts";
 import { isRecord } from "./type-guards.ts";
 
 export const OBSERVATION_API_VERSION = "sheltie.dev/observation/v1alpha1";
@@ -114,6 +115,29 @@ export interface ObservationSummary {
   unresolvedOperationCounts: Record<string, number>;
   stepStatusCounts: Record<ObservationStepStatus, number>;
   messageCounts: Record<ObservationMessageChannel, number>;
+}
+
+/**
+ * The lifecycle subset that may be emitted as a frequent CLI event without
+ * exposing node identities or any raw controller record.
+ */
+export interface ObservationLifecycleProjection {
+  run: Pick<ObservationRun, "runId" | "status" | "generation">;
+  summary: Pick<ObservationSummary, "nodeLifecycleCounts" | "unresolvedOperationCounts">;
+}
+
+export function projectObservationLifecycle(snapshot: ObservationSnapshot): ObservationLifecycleProjection {
+  return {
+    run: {
+      runId: snapshot.run.runId,
+      status: snapshot.run.status,
+      generation: snapshot.run.generation,
+    },
+    summary: {
+      nodeLifecycleCounts: snapshot.summary.nodeLifecycleCounts,
+      unresolvedOperationCounts: snapshot.summary.unresolvedOperationCounts,
+    },
+  };
 }
 
 const TREE_STATUSES = [
@@ -663,7 +687,8 @@ function validateNodeTree(nodes: ObservationNode[], manifest: ParsedManifest): O
 }
 
 /**
- * Reads one immutable, product-safe observation snapshot from a Sheltie state directory.
+ * Reads one immutable, product-safe observation snapshot from an owner-only
+ * Sheltie state directory.
  *
  * The reader never creates, migrates, or writes the state database. The optional clock
  * exists only to make callers that need reproducible snapshots able to supply one.
@@ -675,11 +700,14 @@ export class ObservationReader {
   ) {}
 
   snapshot(): ObservationSnapshot {
-    if (!existsSync(this.stateDirectory) || !statSync(this.stateDirectory).isDirectory()) {
+    const stateDirectory = assertPrivateStateDirectory(this.stateDirectory);
+    if (!existsSync(stateDirectory) || !statSync(stateDirectory).isDirectory()) {
       fail("state directory is missing");
     }
-    const databasePath = join(this.stateDirectory, "state.sqlite");
-    if (!existsSync(databasePath) || !statSync(databasePath).isFile()) fail("state database is missing");
+    const databasePath = join(stateDirectory, "state.sqlite");
+    if (!existsSync(databasePath) || !statSync(databasePath).isFile()) {
+      fail("state database is missing");
+    }
 
     const database = new Database(databasePath, { readonly: true, strict: true });
     let transactionOpen = false;

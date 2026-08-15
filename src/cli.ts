@@ -1,14 +1,14 @@
 #!/usr/bin/env bun
 
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
   AgentCallerAuthenticator,
   assertAuthenticatedAgentCaller,
   type AuthenticatedAgentCaller,
 } from "./agent-caller.ts";
-import { CleanupController } from "./cleanup.ts";
+import { CleanupController, type CleanupPlan } from "./cleanup.ts";
 import { CancellationController } from "./cancel.ts";
 import { commitExistsOnBranch, isCleanWorktree } from "./git.ts";
 import { HerdrClient } from "./herdr-client.ts";
@@ -18,8 +18,9 @@ import { SheltieOrchestrator } from "./orchestrator.ts";
 import { QuiesceController } from "./quiesce.ts";
 import { SheltieStore, type NodeRecord } from "./db.ts";
 import { getManifestRole, parseResolvedManifest, resolveManifestFile } from "./manifest.ts";
-import { ObservationReader } from "./observation.ts";
-import { RealRunController, type RealRunStatus } from "./run.ts";
+import { ObservationReader, projectObservationLifecycle, type ObservationSnapshot } from "./observation.ts";
+import { RealRunController } from "./run.ts";
+import { assertPrivateStateDirectory, assertPrivateStateParentForDatabase, createPrivateStateDirectory } from "./state-security.ts";
 
 interface ParsedArguments {
   positionals: string[];
@@ -86,17 +87,74 @@ function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
+export interface CleanupPlanProjection {
+  planDigest: string;
+  treeGeneration: number;
+  manifestDigest: string | null;
+  actionCount: number;
+  blockerCount: number;
+}
+
+export interface CleanupApplyProjection {
+  plan: CleanupPlanProjection;
+  receiptCount: number;
+  duplicate: boolean;
+}
+
+export function projectCleanupPlan(
+  plan: Pick<CleanupPlan, "planDigest" | "treeGeneration" | "manifestDigest" | "actions" | "blockers">,
+): CleanupPlanProjection {
+  return {
+    planDigest: plan.planDigest,
+    treeGeneration: plan.treeGeneration,
+    manifestDigest: plan.manifestDigest,
+    actionCount: plan.actions.length,
+    blockerCount: plan.blockers.length,
+  };
+}
+
+export function projectCleanupApplyResult(result: {
+  plan: Pick<CleanupPlan, "planDigest" | "treeGeneration" | "manifestDigest" | "actions" | "blockers">;
+  receipts: readonly unknown[];
+  duplicate: boolean;
+}): CleanupApplyProjection {
+  return {
+    plan: projectCleanupPlan(result.plan),
+    receiptCount: result.receipts.length,
+    duplicate: result.duplicate,
+  };
+}
+
+function cleanupPreviewOutput(statePath: string, plan: CleanupPlan, unsafeOutput: boolean): unknown {
+  if (unsafeOutput) return { statePath, mode: "preview", plan };
+  return { mode: "preview", plan: projectCleanupPlan(plan) };
+}
+
+function cleanupApplyOutput(
+  statePath: string,
+  result: {
+    plan: CleanupPlan;
+    receipts: readonly unknown[];
+    duplicate: boolean;
+  },
+  unsafeOutput: boolean,
+): unknown {
+  if (unsafeOutput) return { statePath, mode: "applied", ...result };
+  return { mode: "applied", ...projectCleanupApplyResult(result) };
+}
+
+
 function usage(): string {
   return `sheltie commands:
   sheltie manifest validate --file PATH
   sheltie manifest resolve --file PATH --json
-  sheltie observe snapshot --state PATH
-  sheltie run start --manifest PATH --repo PATH --herdr-socket PATH [--base REF] [--state PATH] [--once]
-  sheltie run resume --state PATH [--once]
-  sheltie run cancel --state PATH [--grace-ms N]
-  sheltie run quiesce --state PATH [--grace-ms N]
-  sheltie run status --state PATH
-  sheltie run cleanup --state PATH [--apply --plan-digest SHA256]
+  sheltie observe snapshot --state PATH [--unsafe-output]
+  sheltie run start --manifest PATH --repo PATH --herdr-socket PATH [--base REF] [--state PATH] [--once] [--unsafe-output]
+  sheltie run resume --state PATH [--once] [--unsafe-output]
+  sheltie run cancel --state PATH [--grace-ms N] [--unsafe-output]
+  sheltie run quiesce --state PATH [--grace-ms N] [--unsafe-output]
+  sheltie run status --state PATH [--unsafe-output]
+  sheltie run cleanup --state PATH [--apply --plan-digest SHA256] [--unsafe-output]
   sheltie spawn --db PATH [--caller-pane ID] --request-key KEY --name NAME --role ROLE [--params-json JSON]
   sheltie step claim --db PATH --operation-id ID [--caller-pane ID]
   sheltie step complete --db PATH --operation-id ID --commit SHA [--caller-pane ID]
@@ -104,7 +162,7 @@ function usage(): string {
   sheltie sync --db PATH [--caller-pane ID] [--wait-ms N]
   sheltie merge --db PATH [--caller-pane ID] --child-node ID
   sheltie message send --db PATH [--caller-pane ID] --to NODE --body TEXT [--kind progress|result] [--priority N]
-  sheltie reconcile --db PATH --tree-id ID
+  sheltie reconcile --db PATH --tree-id ID --unsafe-output
 `;
 }
 
@@ -354,17 +412,29 @@ function defaultStatePath(runId: string): string {
   return join(stateHome, "sheltie", "runs", runId);
 }
 
-function writeRunProgress(status: RealRunStatus, statePath: string): void {
+function readRunSnapshot(statePath: string): ObservationSnapshot {
+  return new ObservationReader(statePath).snapshot();
+}
+
+function writeRunProgress(event: "run_reserved" | "run_progress", snapshot: ObservationSnapshot): void {
   process.stderr.write(
     `${JSON.stringify({
-      event: "run_progress",
-      runId: status.tree.runId,
-      statePath,
-      status: status.tree.status,
-      nodes: status.nodes.map((node) => ({ nodeId: node.nodeId, status: node.lifecycleStatus })),
-      unresolvedOperations: status.operations.length,
+      event,
+      ...projectObservationLifecycle(snapshot),
     })}\n`,
   );
+}
+
+function printRunControlResult(
+  action: "cancel" | "quiesce",
+  snapshot: ObservationSnapshot,
+  unresolvedOperationCount: number,
+): void {
+  printJson({
+    action,
+    observation: snapshot,
+    unresolvedOperationCount,
+  });
 }
 
 async function runUntilSettled(
@@ -382,27 +452,24 @@ async function runUntilSettled(
   process.on("SIGTERM", stop);
   try {
     while (!stopping) {
-      const status = await controller.convergeOnce();
-      const progress = JSON.stringify({
-        tree: status.tree.status,
-        nodes: status.nodes.map((node) => [node.nodeId, node.lifecycleStatus]),
-        operations: status.operations.map((operation) => [operation.operationId, operation.status]),
-      });
+      await controller.convergeOnce();
+      const snapshot = readRunSnapshot(statePath);
+      const progress = JSON.stringify(projectObservationLifecycle(snapshot));
       if (progress !== lastProgress) {
-        writeRunProgress(status, statePath);
+        writeRunProgress("run_progress", snapshot);
         lastProgress = progress;
       }
       if (
         arguments_.flags.has("once") ||
-        ["completed", "failed", "blocked", "cancelled", "cancel_blocked", "cleaned"].includes(status.tree.status)
+        ["completed", "failed", "blocked", "cancelled", "cancel_blocked", "cleaned"].includes(snapshot.run.status)
       ) {
-        printJson({ statePath, ...status });
-        if (["failed", "blocked", "cancel_blocked"].includes(status.tree.status)) process.exitCode = 1;
+        printJson(snapshot);
+        if (["failed", "blocked", "cancel_blocked"].includes(snapshot.run.status)) process.exitCode = 1;
         return;
       }
       await Bun.sleep(pollMs);
     }
-    printJson({ statePath, ...controller.status() });
+    printJson(readRunSnapshot(statePath));
   } finally {
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
@@ -414,17 +481,16 @@ async function runRealRun(arguments_: ParsedArguments): Promise<void> {
   if (action === "start") {
     const runId = optionalFlag(arguments_, "run-id") ?? createId();
     const manifest = resolveManifestFile(resolve(requiredFlag(arguments_, "manifest")));
-    const statePath = resolve(optionalFlag(arguments_, "state") ?? defaultStatePath(runId));
+    const statePath = createPrivateStateDirectory(optionalFlag(arguments_, "state") ?? defaultStatePath(runId));
     const databasePath = databasePathForState(statePath);
-    if (existsSync(databasePath)) throw new Error(`run state already exists at ${databasePath}`);
+    if (existsSync(databasePath)) throw new Error("run state already exists");
     const socketPath = requiredFlag(arguments_, "herdr-socket");
-    mkdirSync(statePath, { recursive: true });
     const store = new SheltieStore(databasePath);
     try {
       const controller = new RealRunController(store, new HerdrClient(socketPath), {
         sheltieExecutable: process.execPath,
-        onTreeReserved: (tree) => {
-          process.stderr.write(`${JSON.stringify({ event: "run_reserved", runId: tree.runId, statePath })}\n`);
+        onTreeReserved: () => {
+          writeRunProgress("run_reserved", readRunSnapshot(statePath));
         },
       });
       await controller.startRun({
@@ -442,21 +508,24 @@ async function runRealRun(arguments_: ParsedArguments): Promise<void> {
     return;
   }
   if (action === "cleanup") {
-    const statePath = resolve(requiredFlag(arguments_, "state"));
+    const statePath = assertPrivateStateDirectory(requiredFlag(arguments_, "state"));
+    // Reject an absent or legacy database before this mutable store could create or migrate it.
+    readRunSnapshot(statePath);
     const databasePath = databasePathForState(statePath);
-    if (!existsSync(databasePath)) throw new Error(`run state does not exist at ${databasePath}`);
     const store = new SheltieStore(databasePath);
     try {
       const tree = store.getOnlyTree();
       const controller = new CleanupController(store, new HerdrClient(tree.herdrSocketPath));
+      // Cleanup is an explicit operator-sensitive exact-target workflow.
+      const unsafeOutput = arguments_.flags.has("unsafe-output");
       if (arguments_.flags.has("apply")) {
         const result = await controller.apply(optionalFlag(arguments_, "plan-digest"));
-        printJson({ statePath, mode: "applied", ...result });
+        printJson(cleanupApplyOutput(statePath, result, unsafeOutput));
       } else {
         if (arguments_.flags.has("plan-digest")) {
           throw new Error("--plan-digest is only valid with --apply");
         }
-        printJson({ statePath, mode: "preview", plan: await controller.preview() });
+        printJson(cleanupPreviewOutput(statePath, await controller.preview(), unsafeOutput));
       }
     } finally {
       store.close();
@@ -466,9 +535,14 @@ async function runRealRun(arguments_: ParsedArguments): Promise<void> {
   if (action !== "resume" && action !== "status" && action !== "cancel" && action !== "quiesce") {
     throw new Error("run action must be start, resume, status, cancel, quiesce, or cleanup");
   }
-  const statePath = resolve(requiredFlag(arguments_, "state"));
+  const statePath = assertPrivateStateDirectory(requiredFlag(arguments_, "state"));
+  if (action === "status") {
+    printJson(readRunSnapshot(statePath));
+    return;
+  }
+  // Reject an absent or legacy database before this mutable store could create or migrate it.
+  readRunSnapshot(statePath);
   const databasePath = databasePathForState(statePath);
-  if (!existsSync(databasePath)) throw new Error(`run state does not exist at ${databasePath}`);
   const store = new SheltieStore(databasePath);
   try {
     const tree = store.getOnlyTree();
@@ -479,7 +553,7 @@ async function runRealRun(arguments_: ParsedArguments): Promise<void> {
         new HerdrClient(tree.herdrSocketPath),
         { graceMs },
       ).quiesceRun();
-      printJson({ statePath, ...result });
+      printRunControlResult("quiesce", readRunSnapshot(statePath), result.unresolvedOperations.length);
       if (result.unresolvedOperations.length > 0) process.exitCode = 1;
       return;
     }
@@ -497,13 +571,10 @@ async function runRealRun(arguments_: ParsedArguments): Promise<void> {
         { graceMs },
       );
       const status = await cancellation.cancelRun();
-      writeRunProgress(status, statePath);
-      printJson({ statePath, ...status });
-      if (status.tree.status === "cancel_blocked") process.exitCode = 1;
-      return;
-    }
-    if (action === "status") {
-      printJson({ statePath, ...controller.status() });
+      const snapshot = readRunSnapshot(statePath);
+      writeRunProgress("run_progress", snapshot);
+      printRunControlResult("cancel", snapshot, status.operations.length);
+      if (snapshot.run.status === "cancel_blocked") process.exitCode = 1;
       return;
     }
     await runUntilSettled(controller, arguments_, statePath);
@@ -513,13 +584,24 @@ async function runRealRun(arguments_: ParsedArguments): Promise<void> {
 }
 
 async function runReconcile(arguments_: ParsedArguments): Promise<void> {
-  const store = new SheltieStore(requiredFlag(arguments_, "db"));
+  if (!arguments_.flags.has("unsafe-output")) {
+    throw new Error("reconcile requires --unsafe-output because it emits operator-only runtime records");
+  }
+  const databasePath = assertPrivateStateParentForDatabase(requiredFlag(arguments_, "db"));
+  const statePath = dirname(databasePath);
+  if (databasePath !== databasePathForState(statePath)) {
+    throw new Error("reconcile requires the canonical state.sqlite database");
+  }
+  // Raw reconciliation is permitted only for an already-current canonical state database.
+  readRunSnapshot(statePath);
   const treeId = requiredFlag(arguments_, "tree-id");
-  const tree = store.getTree(treeId);
-  const orchestrator = new SheltieOrchestrator(store, new HerdrClient(tree.herdrSocketPath), {
-    sheltieExecutable: process.execPath,
-  });
+  const store = new SheltieStore(databasePath);
   try {
+    const tree = store.getTree(treeId);
+    const orchestrator = new SheltieOrchestrator(store, new HerdrClient(tree.herdrSocketPath), {
+      sheltieExecutable: process.execPath,
+    });
+    // Reconciliation output carries runtime locators, so it is never a normal lifecycle surface.
     const nodes = [];
     for (const node of store.listNodes(treeId)) nodes.push(await orchestrator.reconcileNode(node.nodeId));
     printJson({ nodes });
@@ -548,11 +630,19 @@ export async function runCli(argv: string[]): Promise<void> {
   }
 }
 
+export function formatExecutableError(argv: string[], error: unknown): string {
+  const arguments_ = parseArguments(argv);
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  if (arguments_.flags.has("unsafe-output")) return rawMessage;
+  const command = arguments_.positionals[0];
+  return command === "run" || command === "observe" ? "sheltie command failed" : rawMessage;
+}
+
 if (import.meta.main) {
   try {
     await runCli(process.argv.slice(2));
   } catch (error) {
-    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.stderr.write(`${formatExecutableError(process.argv.slice(2), error)}\n`);
     process.exitCode = 1;
   }
 }

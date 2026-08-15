@@ -313,7 +313,7 @@ async function createFixture(): Promise<{
   store.setNodeLifecycle("node-root", "running");
   const herdr = new CollaborationHerdr(repoRoot);
   const orchestrator = new SheltieOrchestrator(store, herdr, {
-    sheltieExecutable: "/workspace/sheltie/dist/sheltie",
+    sheltieExecutable: "/opt/sheltie/bin/sheltie",
     worktreeRoot: join(root, "worktrees"),
     agentReadyTimeoutMs: 100,
   });
@@ -520,7 +520,7 @@ describe("space and tab collaboration", () => {
     });
     let failOnce = true;
     const failing = new SheltieOrchestrator(store, herdr, {
-      sheltieExecutable: "/workspace/sheltie/dist/sheltie",
+      sheltieExecutable: "/opt/sheltie/bin/sheltie",
       failpoint: (name) => {
         if (name === "before_tab_response_persist" && failOnce) {
           failOnce = false;
@@ -577,7 +577,7 @@ describe("space and tab collaboration", () => {
     });
     let failOnce = true;
     const failing = new SheltieOrchestrator(store, herdr, {
-      sheltieExecutable: "/workspace/sheltie/dist/sheltie",
+      sheltieExecutable: "/opt/sheltie/bin/sheltie",
       failpoint: (name) => {
         if (name === "before_tab_response_persist" && failOnce) {
           failOnce = false;
