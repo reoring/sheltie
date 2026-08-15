@@ -1,5 +1,5 @@
 import { dirname } from "node:path";
-import type { NodeRecord, OperationRecord } from "./db.ts";
+import type { NodePlacement, NodeRecord, NodeSpawnPolicy, OperationRecord, TreeRecord } from "./db.ts";
 import { SheltieStore } from "./db.ts";
 import { resolveCommit } from "./git.ts";
 import { HerdrApiError } from "./herdr-client.ts";
@@ -20,17 +20,32 @@ import {
   requestHash,
   worktreePathForBranch,
 } from "./ids.ts";
+import {
+  getManifestRole,
+  parseResolvedManifest,
+  resolveRoleParameters,
+  type ResolvedManifestRole,
+  type ResolvedRunManifest,
+  spawnPolicyForRole,
+} from "./manifest.ts";
 
 export interface HerdrControl {
   ping(): Promise<PongResult>;
   snapshot(): Promise<SessionSnapshot>;
+  workspaceCreate(params: {
+    cwd: string;
+    focus?: boolean;
+    label?: string;
+    env?: Record<string, string>;
+  }): Promise<{ type: "workspace_created"; workspace: WorkspaceInfo; tab: TabInfo; root_pane: PaneInfo }>;
   worktreeList(params: { workspace_id?: string; cwd?: string }): Promise<{
     type: "worktree_list";
     source: { repo_root: string; source_workspace_id?: string };
     worktrees: WorktreeInfo[];
   }>;
   worktreeCreate(params: {
-    workspace_id: string;
+    workspace_id?: string;
+    cwd?: string;
     branch: string;
     base?: string;
     path?: string;
@@ -43,6 +58,14 @@ export interface HerdrControl {
     root_pane: PaneInfo;
     worktree: WorktreeInfo;
   }>;
+  tabCreate(params: {
+    workspace_id: string;
+    cwd?: string;
+    focus?: boolean;
+    label?: string;
+    env?: Record<string, string>;
+  }): Promise<{ type: "tab_created"; tab: TabInfo; root_pane: PaneInfo }>;
+  tabRename(params: { tab_id: string; label: string }): Promise<{ type: "tab_info"; tab: TabInfo }>;
   agentStart(params: {
     name: string;
     kind: string;
@@ -67,6 +90,7 @@ export interface HerdrControl {
 
 export type FailpointName =
   | "before_worktree_response_persist"
+  | "before_tab_response_persist"
   | "before_agent_start_response_persist"
   | "after_prompt_request";
 
@@ -96,9 +120,21 @@ function sessionValue(agent: AgentInfo): string | null {
   return agent.agent_session?.value ?? null;
 }
 
+function tabLabelForNode(node: NodeRecord): string {
+  return `${node.name}-${node.nodeId.slice(-8)}`;
+}
+
+export function rootWorkspaceLabel(nodeId: string): string {
+  return nodeId;
+}
+
+function allowsSpawn(policy: NodeSpawnPolicy, placement: NodePlacement): boolean {
+  return policy === "both" || policy === placement;
+}
+
 function instanceValue(agent: AgentInfo): string {
-  if (agent.agent_instance_id === undefined) {
-    throw new Error(`Herdr agent ${agent.name ?? agent.pane_id} has no instance identity`);
+  if (typeof agent.agent_instance_id !== "string" || agent.agent_instance_id.length === 0) {
+    throw new RuntimeReconcileError(`Agent ${agent.name ?? agent.pane_id} has no protocol-20 per-launch instance identity`);
   }
   return agent.agent_instance_id;
 }
@@ -111,9 +147,6 @@ function resultChildNodeId(operation: OperationRecord): string | null {
 
 export class SheltieOrchestrator {
   private readonly agentKind: string;
-  private readonly maxDepth: number;
-  private readonly maxChildren: number;
-  private readonly maxDescendants: number;
   private readonly agentReadyTimeoutMs: number;
 
   constructor(
@@ -122,9 +155,6 @@ export class SheltieOrchestrator {
     private readonly options: OrchestratorOptions,
   ) {
     this.agentKind = options.agentKind ?? "omp";
-    this.maxDepth = options.maxDepth ?? 2;
-    this.maxChildren = options.maxChildren ?? 5;
-    this.maxDescendants = options.maxDescendants ?? 10;
     this.agentReadyTimeoutMs = options.agentReadyTimeoutMs ?? 60_000;
   }
 
@@ -136,15 +166,60 @@ export class SheltieOrchestrator {
     return pong;
   }
 
+  private manifestForTree(tree: TreeRecord): ResolvedRunManifest | null {
+    if (tree.manifestDigest === null) return null;
+    const record = this.store.getManifest(tree.manifestDigest);
+    if (record === null) throw new Error(`tree ${tree.treeId} manifest ${tree.manifestDigest} is missing`);
+    return parseResolvedManifest(record.resolved);
+  }
+
+  private roleForNode(node: NodeRecord, tree: TreeRecord): ResolvedManifestRole | null {
+    if (node.roleName === null) return null;
+    const manifest = this.manifestForTree(tree);
+    if (manifest === null) throw new Error(`node ${node.nodeId} has role ${node.roleName} without a manifest`);
+    const role = getManifestRole(manifest, node.roleName);
+    if (node.roleDigest !== role.digest) {
+      throw new Error(`node ${node.nodeId} role digest does not match manifest role ${node.roleName}`);
+    }
+    return role;
+  }
+
   async reserveChild(input: {
     parentPaneId: string;
     requestKey: string;
     name: string;
-    taskContract: string;
+    roleName: string;
+    parameters?: unknown;
   }): Promise<NodeRecord> {
     const parent = this.store.findNodeByPane(input.parentPaneId);
     if (parent === null) throw new Error(`no sheltie node is bound to pane ${input.parentPaneId}`);
-    const request = { parentNodeId: parent.nodeId, name: input.name, taskContract: input.taskContract };
+    const tree = this.store.getTree(parent.treeId);
+    const manifest = this.manifestForTree(tree);
+    if (manifest === null || parent.roleName === null) {
+      throw new Error(`node ${parent.nodeId} is not bound to a manifest role`);
+    }
+    const parentRole = getManifestRole(manifest, parent.roleName);
+    if (!parentRole.capabilities.spawn.roles.includes(input.roleName)) {
+      throw new Error(`role ${parentRole.name} cannot spawn role ${input.roleName}`);
+    }
+    const childRole = getManifestRole(manifest, input.roleName);
+    const parameters = resolveRoleParameters(childRole, input.parameters);
+    const nodeId = nodeIdForRequest(parent.treeId, input.requestKey);
+    const existingSibling = this.store.findChildNode(parent.nodeId, input.name);
+    if (existingSibling !== null && existingSibling.nodeId !== nodeId) {
+      throw new Error(
+        `child name ${input.name} is already reserved by a different request under ${parent.nodeId}`,
+      );
+    }
+    const request = {
+      manifestDigest: tree.manifestDigest,
+      parentNodeId: parent.nodeId,
+      parentRole: parentRole.name,
+      name: input.name,
+      targetRole: childRole.name,
+      roleDigest: childRole.digest,
+      parameters,
+    };
     const operation = this.store.reserveOperation({
       operationId: operationIdForRequest(parent.treeId, "spawn", input.requestKey),
       treeId: parent.treeId,
@@ -158,8 +233,11 @@ export class SheltieOrchestrator {
     if (existingChildNodeId !== null) return this.store.getNode(existingChildNodeId);
 
     const baseCommit = await resolveCommit(parent.worktreePath, "HEAD");
-    const branch = branchForNode(parent.branch, input.name);
-    const nodeId = nodeIdForRequest(parent.treeId, input.requestKey);
+    const branch = childRole.placement === "workspace" ? branchForNode(parent.branch, input.name) : parent.branch;
+    const maxChildren = Math.min(
+      manifest.spec.limits.maxChildrenPerNode,
+      parentRole.capabilities.spawn.maxChildren ?? manifest.spec.limits.maxChildrenPerNode,
+    );
     const child = this.store.reserveChildNode(
       {
         nodeId,
@@ -167,18 +245,34 @@ export class SheltieOrchestrator {
         parentNodeId: parent.nodeId,
         name: input.name,
         depth: parent.depth + 1,
+        placement: childRole.placement,
         branch,
         baseCommit,
-        worktreePath: worktreePathForBranch(this.options.worktreeRoot ?? dirname(parent.worktreePath), branch),
-        taskContract: input.taskContract,
+        spawnPolicy: spawnPolicyForRole(manifest, childRole),
+        worktreePath:
+          childRole.placement === "workspace"
+            ? worktreePathForBranch(this.options.worktreeRoot ?? dirname(parent.worktreePath), branch)
+            : parent.worktreePath,
+        taskContract: childRole.prompt.content,
+        roleName: childRole.name,
+        roleDigest: childRole.digest,
+        parameters,
+        resolvedCapabilities: childRole.capabilities,
       },
       {
-        maxDepth: this.maxDepth,
-        maxChildren: this.maxChildren,
-        maxDescendants: this.maxDescendants,
+        maxDepth: manifest.spec.limits.maxDepth,
+        maxChildren,
+        maxDescendants: manifest.spec.limits.maxDescendants,
       },
     );
-    this.store.setOperationStatus(operation.operationId, "completed", { result: { childNodeId: child.nodeId } });
+    this.store.setOperationStatus(operation.operationId, "completed", {
+      result: {
+        childNodeId: child.nodeId,
+        role: childRole.name,
+        placement: child.placement,
+        spawnPolicy: child.spawnPolicy,
+      },
+    });
     return child;
   }
 
@@ -188,53 +282,26 @@ export class SheltieOrchestrator {
     if (tree.status !== "active") {
       throw new Error(`tree ${tree.treeId} is not active (${tree.status})`);
     }
-    if (tree.repoSourceWorkspaceId === null) {
-      throw new Error(`tree ${tree.treeId} has no repository source workspace`);
-    }
     if (node.workspaceId === null || node.paneId === null || node.tabId === null) {
-      const request = {
-        workspace_id: tree.repoSourceWorkspaceId,
-        branch: node.branch,
-        base: node.baseCommit,
-        path: node.worktreePath,
-        label: node.name,
-        focus: false,
-      };
-      const operation = this.store.reserveOperation({
-        operationId: operationIdForRequest(node.treeId, "worktree_create", node.nodeId),
-        treeId: node.treeId,
-        nodeId: node.nodeId,
-        kind: "worktree_create",
-        requestKey: node.nodeId,
-        requestHash: requestHash(request),
-        request,
-      });
-      if (operation.status !== "completed") {
-        this.store.setOperationStatus(operation.operationId, "submitted", { incrementAttempt: true });
-        try {
-          const created = await this.herdr.worktreeCreate(request);
-          await this.options.failpoint?.("before_worktree_response_persist", operation.operationId);
-          node = this.store.bindWorktree(node.nodeId, {
-            workspaceId: created.workspace.workspace_id,
-            tabId: created.tab.tab_id,
-            paneId: created.root_pane.pane_id,
-          });
-          this.store.setOperationStatus(operation.operationId, "completed", { result: created });
-        } catch (error) {
-          this.store.setOperationStatus(operation.operationId, "delivery_unknown", {
-            lastError: error instanceof Error ? error.message : String(error),
-          });
-          throw error;
-        }
-      } else {
-        node = await this.reconcileNode(node.nodeId);
-      }
+      node =
+        node.parentNodeId === null && node.worktreePath === tree.repoRoot
+          ? await this.provisionRootWorkspace(node, tree)
+          : node.placement === "tab"
+            ? await this.provisionTabRuntime(node)
+            : await this.provisionWorkspaceRuntime(node, tree);
     }
 
     if (node.agentName === null) {
       if (node.paneId === null) throw new Error(`node ${node.nodeId} has no pane after worktree provisioning`);
       const name = agentNameForNode(node.nodeId);
-      const request = { name, kind: this.agentKind, pane_id: node.paneId, args: [] as string[], timeout_ms: 60_000 };
+      const role = this.roleForNode(node, tree);
+      const request = {
+        name,
+        kind: role?.agent.kind ?? this.agentKind,
+        pane_id: node.paneId,
+        args: role?.agent.args ?? [],
+        timeout_ms: 60_000,
+      };
       const operation = this.store.reserveOperation({
         operationId: operationIdForRequest(node.treeId, "agent_start", node.nodeId),
         treeId: node.treeId,
@@ -270,14 +337,148 @@ export class SheltieOrchestrator {
     return node;
   }
 
+  private async provisionRootWorkspace(node: NodeRecord, tree: TreeRecord): Promise<NodeRecord> {
+    const request = {
+      cwd: tree.repoRoot,
+      focus: false,
+      label: rootWorkspaceLabel(node.nodeId),
+      env: { SHELTIE_RUN_ID: tree.runId, SHELTIE_NODE_ID: node.nodeId },
+    };
+    let operation = this.store.reserveOperation({
+      operationId: operationIdForRequest(node.treeId, "workspace_create", node.nodeId),
+      treeId: node.treeId,
+      nodeId: node.nodeId,
+      kind: "workspace_create",
+      requestKey: node.nodeId,
+      requestHash: requestHash(request),
+      request,
+    });
+    if (operation.status === "completed") return this.reconcileNode(node.nodeId);
+    if (operation.status !== "reserved") return this.reconcileNode(node.nodeId);
+    operation = this.store.setOperationStatus(operation.operationId, "submitted", { incrementAttempt: true });
+    try {
+      const created = await this.herdr.workspaceCreate(request);
+      await this.herdr.tabRename({ tab_id: created.tab.tab_id, label: "coord" });
+      await this.options.failpoint?.("before_worktree_response_persist", operation.operationId);
+      const bound = this.store.bindWorktree(node.nodeId, {
+        workspaceId: created.workspace.workspace_id,
+        tabId: created.tab.tab_id,
+        paneId: created.root_pane.pane_id,
+      });
+      this.store.bindRepoSourceWorkspace(tree.treeId, created.workspace.workspace_id);
+      this.store.setOperationStatus(operation.operationId, "completed", { result: created });
+      return bound;
+    } catch (error) {
+      this.store.setOperationStatus(operation.operationId, "delivery_unknown", {
+        lastError: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+
+  private async provisionWorkspaceRuntime(node: NodeRecord, tree: TreeRecord): Promise<NodeRecord> {
+    const source =
+      tree.repoSourceWorkspaceId === null
+        ? { cwd: tree.repoRoot }
+        : { workspace_id: tree.repoSourceWorkspaceId };
+    const request = {
+      ...source,
+      branch: node.branch,
+      base: node.baseCommit,
+      path: node.worktreePath,
+      label: node.name,
+      focus: false,
+    };
+    let operation = this.store.reserveOperation({
+      operationId: operationIdForRequest(node.treeId, "worktree_create", node.nodeId),
+      treeId: node.treeId,
+      nodeId: node.nodeId,
+      kind: "worktree_create",
+      requestKey: node.nodeId,
+      requestHash: requestHash(request),
+      request,
+    });
+    if (operation.status === "completed") return this.reconcileNode(node.nodeId);
+    if (operation.status !== "reserved") return this.reconcileNode(node.nodeId);
+    operation = this.store.setOperationStatus(operation.operationId, "submitted", { incrementAttempt: true });
+    try {
+      const created = await this.herdr.worktreeCreate(request);
+      await this.herdr.tabRename({ tab_id: created.tab.tab_id, label: "coord" });
+      await this.options.failpoint?.("before_worktree_response_persist", operation.operationId);
+      const bound = this.store.bindWorktree(node.nodeId, {
+        workspaceId: created.workspace.workspace_id,
+        tabId: created.tab.tab_id,
+        paneId: created.root_pane.pane_id,
+      });
+      this.store.setOperationStatus(operation.operationId, "completed", { result: created });
+      return bound;
+    } catch (error) {
+      this.store.setOperationStatus(operation.operationId, "delivery_unknown", {
+        lastError: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+
+  private async provisionTabRuntime(node: NodeRecord): Promise<NodeRecord> {
+    if (node.parentNodeId === null) throw new Error(`tab node ${node.nodeId} has no parent`);
+    const parent = this.store.getNode(node.parentNodeId);
+    if (parent.workspaceId === null) {
+      throw new Error(`tab node ${node.nodeId} parent ${parent.nodeId} has no workspace`);
+    }
+    const request = {
+      workspace_id: parent.workspaceId,
+      cwd: node.worktreePath,
+      focus: false,
+      label: tabLabelForNode(node),
+      env: {
+        SHELTIE_NODE_ID: node.nodeId,
+        SHELTIE_PARENT_NODE_ID: parent.nodeId,
+      },
+    };
+    let operation = this.store.reserveOperation({
+      operationId: operationIdForRequest(node.treeId, "tab_create", node.nodeId),
+      treeId: node.treeId,
+      nodeId: node.nodeId,
+      kind: "tab_create",
+      requestKey: node.nodeId,
+      requestHash: requestHash(request),
+      request,
+    });
+    if (operation.status === "completed") return this.reconcileNode(node.nodeId);
+    if (operation.status !== "reserved") return this.reconcileNode(node.nodeId);
+    operation = this.store.setOperationStatus(operation.operationId, "submitted", { incrementAttempt: true });
+    try {
+      const created = await this.herdr.tabCreate(request);
+      await this.options.failpoint?.("before_tab_response_persist", operation.operationId);
+      const bound = this.store.bindWorktree(node.nodeId, {
+        workspaceId: created.tab.workspace_id,
+        tabId: created.tab.tab_id,
+        paneId: created.root_pane.pane_id,
+      });
+      this.store.setOperationStatus(operation.operationId, "completed", { result: created });
+      return bound;
+    } catch (error) {
+      this.store.setOperationStatus(operation.operationId, "delivery_unknown", {
+        lastError: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+
   async reconcileNode(nodeId: string): Promise<NodeRecord> {
     let node = this.store.getNode(nodeId);
     const tree = this.store.getTree(node.treeId);
-    if (tree.repoSourceWorkspaceId === null) {
-      throw new Error(`tree ${tree.treeId} has no repository source workspace`);
+    if (node.parentNodeId === null && node.worktreePath === tree.repoRoot) {
+      return this.reconcileRootWorkspace(node, tree);
     }
+    if (node.placement === "tab") return this.reconcileTabNode(node);
+    const source =
+      tree.repoSourceWorkspaceId === null
+        ? { cwd: tree.repoRoot }
+        : { workspace_id: tree.repoSourceWorkspaceId };
     const [listed, snapshot] = await Promise.all([
-      this.herdr.worktreeList({ workspace_id: tree.repoSourceWorkspaceId }),
+      this.herdr.worktreeList(source),
       this.herdr.snapshot(),
     ]);
     const worktreeMatches = listed.worktrees.filter(
@@ -308,6 +509,13 @@ export class SheltieOrchestrator {
       : panes.find((candidate) => candidate.pane_id === agents[0]?.pane_id);
     if (selectedPane === undefined) {
       throw new RuntimeReconcileError(`node ${node.nodeId} has no unique pane in workspace ${workspaceId}`);
+    }
+    const selectedTab = snapshot.tabs.find((tab) => tab.tab_id === selectedPane.tab_id);
+    if (selectedTab === undefined) {
+      throw new RuntimeReconcileError(`workspace ${workspaceId} pane ${selectedPane.pane_id} has no tab`);
+    }
+    if (selectedTab.label !== "coord") {
+      await this.herdr.tabRename({ tab_id: selectedTab.tab_id, label: "coord" });
     }
     node = this.store.bindWorktree(node.nodeId, {
       workspaceId,
@@ -340,6 +548,153 @@ export class SheltieOrchestrator {
       }
     }
     return node;
+  }
+
+  private async reconcileRootWorkspace(node: NodeRecord, tree: TreeRecord): Promise<NodeRecord> {
+    const snapshot = await this.herdr.snapshot();
+    const matches = snapshot.workspaces.filter(
+      (workspace) =>
+        workspace.label === rootWorkspaceLabel(node.nodeId) &&
+        (tree.repoSourceWorkspaceId === null || workspace.workspace_id === tree.repoSourceWorkspaceId) &&
+        workspace.worktree?.checkout_path === tree.repoRoot &&
+        !workspace.worktree.is_linked_worktree,
+    );
+    if (matches.length !== 1) {
+      throw new RuntimeReconcileError(
+        `root node ${node.nodeId} expected one repository workspace; found ${matches.length}`,
+      );
+    }
+    const workspace = matches[0];
+    if (workspace === undefined) throw new RuntimeReconcileError(`root node ${node.nodeId} lost its workspace`);
+    const tabs = snapshot.tabs.filter((tab) => tab.workspace_id === workspace.workspace_id);
+    const tab = node.tabId === null
+      ? tabs.find((candidate) => candidate.label === "coord") ?? (tabs.length === 1 ? tabs[0] : undefined)
+      : tabs.find((candidate) => candidate.tab_id === node.tabId);
+    if (tab === undefined) {
+      throw new RuntimeReconcileError(`root workspace ${workspace.workspace_id} has no unique coordinator tab`);
+    }
+    if (tab.label !== "coord") await this.herdr.tabRename({ tab_id: tab.tab_id, label: "coord" });
+    const panes = snapshot.panes.filter((pane) => pane.tab_id === tab.tab_id);
+    if (panes.length !== 1) {
+      throw new RuntimeReconcileError(`root coordinator tab ${tab.tab_id} expected one pane; found ${panes.length}`);
+    }
+    const pane = panes[0];
+    if (pane === undefined) throw new RuntimeReconcileError(`root coordinator tab ${tab.tab_id} has no pane`);
+    let rebound = this.store.bindWorktree(node.nodeId, {
+      workspaceId: workspace.workspace_id,
+      tabId: tab.tab_id,
+      paneId: pane.pane_id,
+    });
+    if (tree.repoSourceWorkspaceId === null) {
+      this.store.bindRepoSourceWorkspace(tree.treeId, workspace.workspace_id);
+    }
+    const workspaceOperation = this.store.findOperation(
+      operationIdForRequest(node.treeId, "workspace_create", node.nodeId),
+    );
+    if (workspaceOperation !== null && workspaceOperation.status !== "completed") {
+      this.store.setOperationStatus(workspaceOperation.operationId, "completed", {
+        result: { reconciled: true, workspaceId: workspace.workspace_id, tabId: tab.tab_id, paneId: pane.pane_id },
+        lastError: null,
+      });
+    }
+    const expectedAgentName = agentNameForNode(node.nodeId);
+    const agents = snapshot.agents.filter(
+      (agent) => agent.name === expectedAgentName && agent.pane_id === pane.pane_id,
+    );
+    if (agents.length > 1) {
+      throw new RuntimeReconcileError(`root node ${node.nodeId} has duplicate agent ${expectedAgentName}`);
+    }
+    const selectedAgent = agents[0];
+    if (selectedAgent !== undefined) {
+      rebound = this.store.bindAgent(node.nodeId, {
+        agentName: expectedAgentName,
+        agentSession: sessionValue(selectedAgent),
+        terminalId: selectedAgent.terminal_id,
+        agentInstanceId: instanceValue(selectedAgent),
+      });
+      const agentOperation = this.store.findOperation(
+        operationIdForRequest(node.treeId, "agent_start", node.nodeId),
+      );
+      if (agentOperation !== null && agentOperation.status !== "completed") {
+        this.store.setOperationStatus(agentOperation.operationId, "completed", {
+          result: { reconciled: true, agentName: expectedAgentName, paneId: selectedAgent.pane_id },
+          lastError: null,
+        });
+      }
+    }
+    return rebound;
+  }
+
+  private async reconcileTabNode(node: NodeRecord): Promise<NodeRecord> {
+    if (node.parentNodeId === null) throw new RuntimeReconcileError(`tab node ${node.nodeId} has no parent`);
+    const parent = this.store.getNode(node.parentNodeId);
+    if (parent.workspaceId === null) {
+      throw new RuntimeReconcileError(`tab node ${node.nodeId} parent ${parent.nodeId} has no workspace`);
+    }
+    const snapshot = await this.herdr.snapshot();
+    const tabMatches = snapshot.tabs.filter(
+      (tab) =>
+        tab.workspace_id === parent.workspaceId &&
+        (node.tabId === null ? tab.label === tabLabelForNode(node) : tab.tab_id === node.tabId),
+    );
+    if (tabMatches.length !== 1) {
+      throw new RuntimeReconcileError(
+        `tab node ${node.nodeId} expected one tab ${tabLabelForNode(node)} in ${parent.workspaceId}; found ${tabMatches.length}`,
+      );
+    }
+    const tab = tabMatches[0];
+    if (tab === undefined) throw new RuntimeReconcileError(`tab node ${node.nodeId} lost its tab match`);
+    const panes = snapshot.panes.filter((pane) => pane.tab_id === tab.tab_id);
+    if (panes.length !== 1) {
+      throw new RuntimeReconcileError(`tab ${tab.tab_id} expected one root pane; found ${panes.length}`);
+    }
+    const selectedPane = panes[0];
+    if (selectedPane === undefined) throw new RuntimeReconcileError(`tab ${tab.tab_id} has no root pane`);
+    if (selectedPane.cwd !== undefined && selectedPane.cwd !== node.worktreePath) {
+      throw new RuntimeReconcileError(
+        `tab ${tab.tab_id} cwd ${selectedPane.cwd} differs from shared worktree ${node.worktreePath}`,
+      );
+    }
+    let rebound = this.store.bindWorktree(node.nodeId, {
+      workspaceId: parent.workspaceId,
+      tabId: tab.tab_id,
+      paneId: selectedPane.pane_id,
+    });
+    const tabOperation = this.store.findOperation(
+      operationIdForRequest(node.treeId, "tab_create", node.nodeId),
+    );
+    if (tabOperation !== null && tabOperation.status !== "completed") {
+      this.store.setOperationStatus(tabOperation.operationId, "completed", {
+        result: { reconciled: true, workspaceId: parent.workspaceId, tabId: tab.tab_id, paneId: selectedPane.pane_id },
+        lastError: null,
+      });
+    }
+    const expectedAgentName = agentNameForNode(node.nodeId);
+    const agents = snapshot.agents.filter(
+      (agent) => agent.name === expectedAgentName && agent.pane_id === selectedPane.pane_id,
+    );
+    if (agents.length > 1) {
+      throw new RuntimeReconcileError(`tab node ${node.nodeId} has duplicate agent ${expectedAgentName}`);
+    }
+    const selectedAgent = agents[0];
+    if (selectedAgent !== undefined) {
+      rebound = this.store.bindAgent(node.nodeId, {
+        agentName: expectedAgentName,
+        agentSession: sessionValue(selectedAgent),
+        terminalId: selectedAgent.terminal_id,
+        agentInstanceId: instanceValue(selectedAgent),
+      });
+      const agentOperation = this.store.findOperation(
+        operationIdForRequest(node.treeId, "agent_start", node.nodeId),
+      );
+      if (agentOperation !== null && agentOperation.status !== "completed") {
+        this.store.setOperationStatus(agentOperation.operationId, "completed", {
+          result: { reconciled: true, agentName: expectedAgentName, paneId: selectedAgent.pane_id },
+          lastError: null,
+        });
+      }
+    }
+    return rebound;
   }
 
   async dispatchStep(nodeId: string, stepKey: string, taskContract: string): Promise<OperationRecord> {
@@ -398,11 +753,19 @@ export class SheltieOrchestrator {
 
   async processPendingNodes(treeId: string): Promise<NodeRecord[]> {
     const processed: NodeRecord[] = [];
-    for (const candidate of this.store.listNodes(treeId)) {
-      if (candidate.agentName !== null || candidate.lifecycleStatus === "completed") continue;
+    const tree = this.store.getTree(treeId);
+    const manifest = this.manifestForTree(tree);
+    const nodes = this.store.listNodes(treeId);
+    const terminal = new Set(["completed", "failed", "cancelled", "cancel_blocked"]);
+    let active = nodes.filter((node) => node.agentName !== null && !terminal.has(node.lifecycleStatus)).length;
+    const maxParallel = manifest?.spec.limits.maxParallelNodes ?? Number.POSITIVE_INFINITY;
+    for (const candidate of nodes) {
+      if (candidate.agentName !== null || terminal.has(candidate.lifecycleStatus)) continue;
+      if (active >= maxParallel) break;
       const provisioned = await this.provisionNode(candidate.nodeId);
       await this.dispatchStep(provisioned.nodeId, "initial", provisioned.taskContract);
       processed.push(this.store.getNode(provisioned.nodeId));
+      active += 1;
     }
     return processed;
   }
@@ -445,35 +808,117 @@ export class SheltieOrchestrator {
     const executable = shellQuote(this.options.sheltieExecutable);
     const database = shellQuote(this.store.path);
     const nodeId = shellQuote(node.nodeId);
+    const tree = this.store.getTree(node.treeId);
+    const manifest = this.manifestForTree(tree);
+    const role = this.roleForNode(node, tree);
+    const roleLabel = role === null ? "legacy" : role.name;
     const instructions = [
-      `You are sheltie node ${node.name} (${node.nodeId}).`,
+      `You are sheltie ${node.placement} node ${node.name} (${node.nodeId}), role ${roleLabel}.`,
       "Before changing files or spawning children, run exactly:",
-      `${executable} step claim --db ${database} --operation-id ${shellQuote(operationId)} --agent-session \"$HERDR_PANE_ID\"`,
+      `${executable} step claim --db ${database} --operation-id ${shellQuote(operationId)} --caller-pane "$HERDR_PANE_ID"`,
       "Continue only when the JSON outcome is claimed. Stop without work for already_claimed, completed, or conflict.",
       "",
       "Task contract:",
       taskContract,
       "",
-      "To wait up to three minutes for unread child results, run:",
-      `${executable} sync --db ${database} --node-id ${nodeId} --wait-ms 180000`,
-      "After a child reports completion, merge its committed result from this parent worktree with:",
-      `${executable} merge --db ${database} --parent-pane \"$HERDR_PANE_ID\" --child-node <child-node-id>`,
-      "Use the childNodeId returned by spawn. Merge every direct child before finishing this node.",
     ];
-    if (node.parentNodeId !== null) {
+    if (role !== null && Object.keys(node.parameters as Record<string, unknown>).length > 0) {
+      instructions.push("Role parameters (canonical JSON):", JSON.stringify(node.parameters), "");
+    }
+    if (manifest !== null && role !== null) {
+      if (role.capabilities.spawn.roles.length === 0) {
+        instructions.push(
+          "Child spawning is not authorized for this role. Do not run sheltie spawn, even if the task text suggests it.",
+          "",
+        );
+      } else {
+        instructions.push("Authorized child roles:");
+        for (const childRoleName of role.capabilities.spawn.roles) {
+          const childRole = getManifestRole(manifest, childRoleName);
+          const parameterFlag = Object.keys(childRole.parameters).length === 0
+            ? ""
+            : " --params-json '<json-object>'";
+          instructions.push(
+            `- ${childRoleName}: ${childRole.placement} placement`,
+            `${executable} spawn --db ${database} --caller-pane "$HERDR_PANE_ID" --request-key <stable-key> --name <name> --role ${shellQuote(childRoleName)}${parameterFlag}`,
+          );
+        }
+        instructions.push("- Spawn only roles listed above. The manifest fixes placement, prompt, Agent kind, and capabilities.", "");
+      }
+    } else if (node.spawnPolicy === "none") {
       instructions.push(
-        "To send a result to the parent, use this command with a concrete result body:",
-        `${executable} message send --db ${database} --from ${nodeId} --to ${shellQuote(node.parentNodeId)} --body \"<result>\"`,
+        "Child spawning is not authorized for this node. Do not run sheltie spawn, even if the task text suggests it.",
+        "",
       );
+    } else {
+      instructions.push("Authorized child topology:");
+      if (allowsSpawn(node.spawnPolicy, "workspace")) {
+        instructions.push(
+          "- Spawn an isolated child space with its own branch/worktree:",
+          `${executable} spawn --db ${database} --caller-pane "$HERDR_PANE_ID" --request-key <stable-key> --name <name> --placement workspace --child-spawn-policy none --task "<task>"`,
+        );
+      }
+      if (allowsSpawn(node.spawnPolicy, "tab")) {
+        instructions.push(
+          "- Spawn a collaborator tab in this same space and shared worktree:",
+          `${executable} spawn --db ${database} --caller-pane "$HERDR_PANE_ID" --request-key <stable-key> --name <name> --placement tab --child-spawn-policy none --task "<task>"`,
+        );
+      }
+      instructions.push("");
     }
     instructions.push(
-      "",
-      "Commit every change on the current branch. Then complete this step with:",
-      `${executable} step complete --db ${database} --operation-id ${shellQuote(operationId)} --agent-session \"$HERDR_PANE_ID\" --commit \"$(git rev-parse HEAD)\"`,
-      "After every spawned child has completed and its result has been handled, finish this node with:",
-      `${executable} node finish --db ${database} --node-id ${nodeId} --agent-session \"$HERDR_PANE_ID\"`,
-      "Never finish the node while a child or step is incomplete.",
+      "Durable inbox:",
+      `- Receive unread messages with: ${executable} sync --db ${database} --caller-pane "$HERDR_PANE_ID" --wait-ms 180000`,
+      `- Send an ordinary update with: ${executable} message send --db ${database} --caller-pane "$HERDR_PANE_ID" --to <node-id> --kind progress --body "<update>"`,
+      "- progress/message != completion: a progress message is not a completion signal.",
+      "- Treat only a result-kind message from a completed sender as a completion message.",
+      "- Message bodies are stored in SQLite. Herdr prompt is not the message transport.",
     );
+    if (role?.capabilities.mergeChildren ?? true) {
+      instructions.push(
+        "",
+        "Merge an authorized workspace child only after its result-kind message arrives from a completed sender:",
+        `${executable} merge --db ${database} --caller-pane "$HERDR_PANE_ID" --child-node <child-node-id>`,
+        "Do not merge from progress messages; the database rejects result messages until their sender is completed.",
+        "Do not merge tab children; they share this branch/worktree. Handle their inbox result and wait for their completion.",
+      );
+    } else {
+      instructions.push("", "This role is not authorized to merge child branches.");
+    }
+    if (node.placement === "tab") {
+      instructions.push(
+        "",
+        "This tab shares its parent worktree.",
+        role?.executionPolicy.workspace === "read-write"
+          ? "The manifest permits cooperative read-write work, but coordinate the shared scope before changing files."
+          : "The manifest declares this workspace read-only for this role. Do not modify files or create commits.",
+        "For research/message-only work, complete the step with the unchanged current HEAD.",
+      );
+    }
+    const stepCompletionCommand =
+      `${executable} step complete --db ${database} --operation-id ${shellQuote(operationId)} --caller-pane "$HERDR_PANE_ID" --commit "$(git rev-parse HEAD)"`;
+    const nodeFinishCommand =
+      `${executable} node finish --db ${database} --node-id ${nodeId} --caller-pane "$HERDR_PANE_ID"`;
+    instructions.push("");
+    if (node.parentNodeId === null) {
+      instructions.push(
+        node.placement === "workspace"
+          ? "Commit every owned change on the current branch. Then complete this step with:"
+          : "After respecting the shared-worktree rule, complete this step with:",
+        stepCompletionCommand,
+        "After every spawned child has completed and every inbox result has been handled, finish this node with:",
+        nodeFinishCommand,
+        "Never finish the node while a child or step is incomplete.",
+      );
+    } else {
+      instructions.push(
+        "Non-root finalization order:",
+        `1. Complete the step: ${stepCompletionCommand}`,
+        `2. Finish this node after every spawned child has completed and every inbox result has been handled: ${nodeFinishCommand}`,
+        `3. Send the parent the final result: ${executable} message send --db ${database} --caller-pane "$HERDR_PANE_ID" --to ${shellQuote(node.parentNodeId)} --kind result --body "<result>"`,
+        "Never finish the node while a child or step is incomplete.",
+      );
+    }
     return instructions.join("\n");
   }
 }

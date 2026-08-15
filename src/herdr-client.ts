@@ -49,6 +49,7 @@ export interface WorkspaceInfo {
 export interface TabInfo {
   tab_id: string;
   workspace_id: string;
+  label?: string;
 }
 
 export interface PaneInfo {
@@ -180,6 +181,10 @@ export class HerdrClient {
     return this.request("workspace.create", params);
   }
 
+  workspaceClose(params: { workspace_id: string }): Promise<{ type: "ok" }> {
+    return this.request("workspace.close", params);
+  }
+
   worktreeList(params: { workspace_id?: string; cwd?: string }): Promise<{
     type: "worktree_list";
     source: { repo_root: string; source_workspace_id?: string };
@@ -189,9 +194,9 @@ export class HerdrClient {
   }
 
   worktreeCreate(params: {
-    workspace_id: string;
+    workspace_id?: string;
+    cwd?: string;
     branch: string;
-
     base?: string;
     path?: string;
     label?: string;
@@ -204,6 +209,29 @@ export class HerdrClient {
     worktree: WorktreeInfo;
   }> {
     return this.request("worktree.create", params);
+  }
+
+  worktreeRemove(params: { workspace_id: string; force: boolean }): Promise<{
+    type: "worktree_removed";
+    workspace_id: string;
+    path: string;
+    forced: boolean;
+  }> {
+    return this.request("worktree.remove", params);
+  }
+
+  tabCreate(params: {
+    workspace_id: string;
+    cwd?: string;
+    focus?: boolean;
+    label?: string;
+    env?: Record<string, string>;
+  }): Promise<{ type: "tab_created"; tab: TabInfo; root_pane: PaneInfo }> {
+    return this.request("tab.create", params);
+  }
+
+  tabRename(params: { tab_id: string; label: string }): Promise<{ type: "tab_info"; tab: TabInfo }> {
+    return this.request("tab.rename", params);
   }
   serverStop(): Promise<{ type: "ok" }> {
     return this.request("server.stop", {});

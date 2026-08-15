@@ -2,7 +2,7 @@ import type { NodeRecord, OperationRecord } from "./db.ts";
 import { SheltieStore } from "./db.ts";
 import { HerdrApiError, type AgentInfo, type PongResult } from "./herdr-client.ts";
 import { operationIdForRequest, requestHash } from "./ids.ts";
-import type { RealRunStatus } from "./run.ts";
+import type { InternalRunStatus } from "./run.ts";
 
 export interface AgentControlResult {
   type: "agent_controlled";
@@ -69,7 +69,8 @@ export class CancellationController {
     }
   }
 
-  async cancelRun(): Promise<RealRunStatus> {
+  async cancelRun(): Promise<InternalRunStatus> {
+    if (this.store.getOnlyTree().status === "cleaned") return this.status();
     const pong = await this.herdr.ping();
     if (pong.capabilities?.agent_control !== true) {
       throw new Error("Herdr runtime does not advertise agent_control capability");
@@ -78,9 +79,9 @@ export class CancellationController {
     return this.convergeOnce();
   }
 
-  async convergeOnce(): Promise<RealRunStatus> {
+  async convergeOnce(): Promise<InternalRunStatus> {
     let tree = this.store.getOnlyTree();
-    if (tree.status === "completed" || tree.status === "failed" || tree.status === "cancelled") {
+    if (tree.status === "completed" || tree.status === "failed" || tree.status === "cancelled" || tree.status === "cleaned") {
       return this.status();
     }
     if (!CANCELLATION_TREE_STATES.has(tree.status)) this.store.requestCancellation();
@@ -99,7 +100,7 @@ export class CancellationController {
     return this.status();
   }
 
-  status(): RealRunStatus {
+  status(): InternalRunStatus {
     const tree = this.store.getOnlyTree();
     return {
       tree,

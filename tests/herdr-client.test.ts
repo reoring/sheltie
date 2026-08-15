@@ -66,4 +66,74 @@ describe("HerdrClient", () => {
       expect((error as HerdrApiError).code).toBe("linked_worktree_source");
     }
   });
+
+  test("sends exact cleanup methods without force escalation", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const socketPath = await serve((request) => {
+      requests.push(request);
+      if (request.method === "workspace.close") {
+        return { id: request.id, result: { type: "ok" } };
+      }
+      return {
+        id: request.id,
+        result: {
+          type: "worktree_removed",
+          workspace_id: "w-child",
+          path: "/tmp/child",
+          forced: false,
+        },
+      };
+    });
+    const client = new HerdrClient(socketPath, { timeoutMs: 1_000 });
+
+    await client.worktreeRemove({ workspace_id: "w-child", force: false });
+    await client.workspaceClose({ workspace_id: "w-source" });
+
+    expect(requests.map((request) => ({ method: request.method, params: request.params }))).toEqual([
+      { method: "worktree.remove", params: { workspace_id: "w-child", force: false } },
+      { method: "workspace.close", params: { workspace_id: "w-source" } },
+    ]);
+  });
+
+  test("creates a labeled collaborator tab in an exact workspace and cwd", async () => {
+    let received: Record<string, unknown> | null = null;
+    const socketPath = await serve((request) => {
+      received = request;
+      return {
+        id: request.id,
+        result: {
+          type: "tab_created",
+          tab: { tab_id: "w-team:t2", workspace_id: "w-team", label: "reviewer" },
+          root_pane: {
+            pane_id: "w-team:p2",
+            workspace_id: "w-team",
+            tab_id: "w-team:t2",
+            cwd: "/tmp/team",
+            agent_status: "idle",
+          },
+        },
+      };
+    });
+    const client = new HerdrClient(socketPath, { timeoutMs: 1_000 });
+
+    const created = await client.tabCreate({
+      workspace_id: "w-team",
+      cwd: "/tmp/team",
+      label: "reviewer",
+      focus: false,
+      env: { SHELTIE_NODE_ID: "node-reviewer" },
+    });
+
+    expect(created.tab).toMatchObject({ tab_id: "w-team:t2", label: "reviewer" });
+    expect(received).toMatchObject({
+      method: "tab.create",
+      params: {
+        workspace_id: "w-team",
+        cwd: "/tmp/team",
+        label: "reviewer",
+        focus: false,
+        env: { SHELTIE_NODE_ID: "node-reviewer" },
+      },
+    });
+  });
 });

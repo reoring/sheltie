@@ -1,0 +1,15 @@
+id = "sheltie.observation-cockpit"
+name = "Sheltie Observation Cockpit"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Read-only viewer for versioned Sheltie observation snapshots (refresh only)"
+platforms = ["linux"]
+
+[[panes]]
+id = "cockpit"
+title = "Sheltie Cockpit"
+description = "Displays the latest ObservationSnapshot. Actions: r refresh, q quit."
+placement = "popup"
+width = "80%"
+height = "80%"
+command = ["bun", "run", "src/cockpit.ts"]

@@ -1,34 +1,24 @@
 import { mkdirSync, realpathSync } from "node:fs";
-import type { TreeRecord } from "./db.ts";
+import type { MessageRecord, NodeRecord, OperationRecord, StepExecutionRecord, TreeRecord } from "./db.ts";
 import { SheltieStore } from "./db.ts";
-import { isCleanWorktree, resolveCommit } from "./git.ts";
-import type {
-  PaneInfo,
-  PongResult,
-  SessionSnapshot,
-  TabInfo,
-  WorkspaceInfo,
-} from "./herdr-client.ts";
-import { branchForNode, nodeIdForRequest, operationIdForRequest, requestHash, worktreePathForBranch } from "./ids.ts";
-import { type HerdrControl, SheltieOrchestrator } from "./orchestrator.ts";
+import { CommandError, isCleanWorktree, resolveCommit, runGit } from "./git.ts";
+import type { PongResult } from "./herdr-client.ts";
+import { branchForNode, nodeIdForRequest, operationIdForRequest, requestHash } from "./ids.ts";
+import {
+  getManifestRole,
+  parseResolvedManifest,
+  type ResolvedManifestDocument,
+  spawnPolicyForRole,
+} from "./manifest.ts";
+import { rootWorkspaceLabel, type HerdrControl, SheltieOrchestrator } from "./orchestrator.ts";
 
 const REQUIRED_HERDR_VERSION = "0.8.0";
 const REQUIRED_HERDR_PROTOCOL = 20;
 
-export interface RunHerdrControl extends HerdrControl {
-  workspaceCreate(params: {
-    cwd: string;
-    focus?: boolean;
-    label?: string;
-    env?: Record<string, string>;
-  }): Promise<{ type: "workspace_created"; workspace: WorkspaceInfo; tab: TabInfo; root_pane: PaneInfo }>;
-}
-
-export type RealRunFailpoint = "before_source_workspace_response_persist";
+export type RunHerdrControl = HerdrControl;
 
 export interface RealRunControllerOptions {
   sheltieExecutable: string;
-  failpoint?: (name: RealRunFailpoint, operationId: string) => void | Promise<void>;
   onTreeReserved?: (tree: TreeRecord) => void;
 }
 
@@ -37,16 +27,22 @@ export interface StartRunInput {
   repoRoot: string;
   base: string;
   worktreeRoot: string;
-  taskContract: string;
+  manifest: ResolvedManifestDocument;
   herdrSocketPath: string;
 }
 
-export interface RealRunStatus {
+/**
+ * Raw controller state used only inside trusted lifecycle controllers.
+ *
+ * It contains task, path, runtime identity, and message details, so CLI and
+ * other public serializers must project an ObservationSnapshot instead.
+ */
+export interface InternalRunStatus {
   tree: TreeRecord;
-  nodes: ReturnType<SheltieStore["listNodes"]>;
-  operations: ReturnType<SheltieStore["listUnresolvedOperations"]>;
-  steps: ReturnType<SheltieStore["listSteps"]>;
-  messages: ReturnType<SheltieStore["listMessages"]>;
+  nodes: NodeRecord[];
+  operations: OperationRecord[];
+  steps: StepExecutionRecord[];
+  messages: MessageRecord[];
 }
 
 function runSuffix(runId: string): string {
@@ -57,13 +53,11 @@ function treeIdForRun(runId: string): string {
   return `tree-${requestHash(runId).slice(0, 24)}`;
 }
 
-function sourceWorkspaceLabel(runId: string): string {
-  return `sheltie-source-${runSuffix(runId)}`;
-}
 
 function rootBranch(runId: string): string {
   return branchForNode(null, `run-${runSuffix(runId)}-root`);
 }
+
 
 function isUncertain(status: string): boolean {
   return status === "submitted" || status === "delivery_unknown";
@@ -78,9 +72,8 @@ export class RealRunController {
 
   async startRun(input: StartRunInput): Promise<TreeRecord> {
     const runId = input.runId.trim();
-    const taskContract = input.taskContract.trim();
     if (runId.length === 0 || runId.length > 128) throw new Error("runId must contain 1-128 characters");
-    if (taskContract.length === 0) throw new Error("task contract must not be empty");
+    const rootRole = getManifestRole(input.manifest.manifest, input.manifest.manifest.spec.root.role);
     const pong = await this.verifyRuntime();
     const repoRoot = realpathSync(input.repoRoot);
     if (!(await isCleanWorktree(repoRoot))) {
@@ -88,7 +81,13 @@ export class RealRunController {
     }
     const baseCommit = await resolveCommit(repoRoot, input.base);
     mkdirSync(input.worktreeRoot, { recursive: true });
-    const tree = this.store.createTree({
+    const tree = this.store.createManifestTree(
+      {
+        manifestDigest: input.manifest.digest,
+        apiVersion: input.manifest.manifest.apiVersion,
+        resolved: input.manifest.manifest,
+      },
+      {
       treeId: treeIdForRun(runId),
       runId,
       repoRoot,
@@ -98,44 +97,60 @@ export class RealRunController {
       herdrProtocol: pong.protocol,
       baseCommit,
       worktreeRoot: input.worktreeRoot,
-      rootTaskContract: taskContract,
+      rootTaskContract: rootRole.prompt.content,
+      rootSpawnPolicy: spawnPolicyForRole(input.manifest.manifest, rootRole),
+      manifestDigest: input.manifest.digest,
+      rootRole: rootRole.name,
       status: "initializing",
-    });
+      },
+    );
     this.options.onTreeReserved?.(tree);
     return this.resumeBootstrap();
   }
 
   async resumeBootstrap(): Promise<TreeRecord> {
     let tree = this.store.getOnlyTree();
+    if (tree.status === "cleaned") return tree;
     await this.verifyRuntime(tree);
-    if (tree.repoSourceWorkspaceId === null) {
-      tree = await this.ensureSourceWorkspace(tree);
+    if (tree.manifestDigest === null || tree.rootRole === null) {
+      throw new Error(`tree ${tree.treeId} has no resolved manifest identity`);
     }
+    const record = this.store.getManifest(tree.manifestDigest);
+    if (record === null) throw new Error(`tree ${tree.treeId} manifest ${tree.manifestDigest} is missing`);
+    const manifest = parseResolvedManifest(record.resolved);
+    const rootRole = getManifestRole(manifest, tree.rootRole);
     if (this.store.findRootNode(tree.treeId) === null) {
       const branch = rootBranch(tree.runId);
+      await this.ensureRootBranch(tree, branch);
       this.store.reserveNode({
         nodeId: nodeIdForRequest(tree.treeId, "root"),
         treeId: tree.treeId,
         parentNodeId: null,
-        name: "root",
+        name: manifest.spec.root.name,
         depth: 0,
+        placement: "workspace",
+        spawnPolicy: spawnPolicyForRole(manifest, rootRole),
         branch,
         baseCommit: tree.baseCommit,
-        worktreePath: worktreePathForBranch(tree.worktreeRoot, branch),
-        taskContract: tree.rootTaskContract,
+        worktreePath: tree.repoRoot,
+        taskContract: rootRole.prompt.content,
+        roleName: rootRole.name,
+        roleDigest: rootRole.digest,
+        parameters: {},
+        resolvedCapabilities: rootRole.capabilities,
       });
     }
     if (tree.status === "initializing") tree = this.store.setTreeStatus(tree.treeId, "active");
     return tree;
   }
 
-  async convergeOnce(): Promise<RealRunStatus> {
+  async convergeOnce(): Promise<InternalRunStatus> {
     const current = this.store.getOnlyTree();
-    if (["cancel_requested", "cancelling", "cancelled", "cancel_blocked"].includes(current.status)) {
+    if (["cancel_requested", "cancelling", "cancelled", "cancel_blocked", "cleaned"].includes(current.status)) {
       return this.status();
     }
     let tree = await this.resumeBootstrap();
-    if (tree.status === "completed" || tree.status === "failed") return this.status();
+    if (tree.status === "completed" || tree.status === "failed" || tree.status === "cleaned") return this.status();
     const orchestrator = new SheltieOrchestrator(this.store, this.herdr, {
       sheltieExecutable: this.options.sheltieExecutable,
       worktreeRoot: tree.worktreeRoot,
@@ -151,6 +166,7 @@ export class RealRunController {
         await orchestrator.dispatchStep(node.nodeId, "initial", node.taskContract);
       }
     }
+    tree = this.store.getTree(tree.treeId);
     const nodes = this.store.listNodes(tree.treeId);
     if (nodes.some((node) => node.lifecycleStatus === "failed")) {
       tree = this.store.setTreeStatus(tree.treeId, "failed");
@@ -164,7 +180,7 @@ export class RealRunController {
     return { ...this.status(), tree };
   }
 
-  status(): RealRunStatus {
+  status(): InternalRunStatus {
     const tree = this.store.getOnlyTree();
     return {
       tree,
@@ -173,6 +189,41 @@ export class RealRunController {
       steps: this.store.listSteps(tree.treeId),
       messages: this.store.listMessages(tree.treeId),
     };
+  }
+
+  private async ensureRootBranch(tree: TreeRecord, branch: string): Promise<void> {
+    const currentBranch = await runGit(tree.repoRoot, ["branch", "--show-current"]);
+    if (currentBranch === branch) return;
+    let branchHead: string | null = null;
+    try {
+      branchHead = await resolveCommit(tree.repoRoot, branch);
+    } catch (error) {
+      if (!(error instanceof CommandError && error.exitCode === 128)) throw error;
+    }
+    if (branchHead !== null && branchHead !== tree.baseCommit) {
+      throw new Error(`root branch ${branch} points to ${branchHead}, expected base ${tree.baseCommit}`);
+    }
+    if (tree.status !== "initializing") {
+      throw new Error(`root source checkout is on ${currentBranch || "detached HEAD"}, expected ${branch}`);
+    }
+    const label = rootWorkspaceLabel(nodeIdForRequest(tree.treeId, "root"));
+    const rootWorkspaces = (await this.herdr.snapshot()).workspaces.filter(
+      (workspace) =>
+        workspace.worktree?.checkout_path === tree.repoRoot &&
+        !workspace.worktree.is_linked_worktree,
+    );
+    const matchingWorkspaces = rootWorkspaces.filter(
+      (workspace) =>
+        workspace.label === label &&
+        (tree.repoSourceWorkspaceId === null || workspace.workspace_id === tree.repoSourceWorkspaceId),
+    );
+    if (rootWorkspaces.length !== matchingWorkspaces.length || matchingWorkspaces.length > 1) {
+      throw new Error(
+        `root source checkout ${tree.repoRoot} is open in a foreign or ambiguous Herdr workspace`,
+      );
+    }
+    if (branchHead === null) await runGit(tree.repoRoot, ["switch", "-c", branch, tree.baseCommit]);
+    else await runGit(tree.repoRoot, ["switch", branch]);
   }
 
   private async verifyRuntime(expected?: TreeRecord): Promise<PongResult> {
@@ -190,78 +241,26 @@ export class RealRunController {
     return pong;
   }
 
-  private async ensureSourceWorkspace(tree: TreeRecord): Promise<TreeRecord> {
-    const request = {
-      cwd: tree.repoRoot,
-      focus: false,
-      label: sourceWorkspaceLabel(tree.runId),
-      env: { SHELTIE_RUN_ID: tree.runId },
-    };
-    const operationId = operationIdForRequest(tree.treeId, "workspace_create", "repo-source");
-    let operation = this.store.reserveOperation({
-      operationId,
-      treeId: tree.treeId,
-      nodeId: null,
-      kind: "workspace_create",
-      requestKey: "repo-source",
-      requestHash: requestHash(request),
-      request,
-    });
-    if (operation.status === "reserved") {
-      operation = this.store.setOperationStatus(operation.operationId, "submitted", { incrementAttempt: true });
-      try {
-        const created = await this.herdr.workspaceCreate(request);
-        await this.options.failpoint?.("before_source_workspace_response_persist", operation.operationId);
-        tree = this.store.bindRepoSourceWorkspace(tree.treeId, created.workspace.workspace_id);
-        this.store.setOperationStatus(operation.operationId, "completed", { result: created });
-        return tree;
-      } catch (error) {
-        this.store.setOperationStatus(operation.operationId, "delivery_unknown", {
-          lastError: error instanceof Error ? error.message : String(error),
-        });
-        throw error;
-      }
-    }
-    if (operation.status === "blocked" || operation.status === "failed") {
-      throw new Error(`source workspace operation is ${operation.status}: ${operation.lastError ?? "unknown error"}`);
-    }
-    const snapshot = await this.herdr.snapshot();
-    const matches = this.matchingSourceWorkspaces(snapshot, tree, request.label);
-    if (matches.length > 1) {
-      this.store.setOperationStatus(operation.operationId, "blocked", {
-        lastError: `found ${matches.length} source workspaces for ${request.label}`,
-      });
-      this.store.setTreeStatus(tree.treeId, "blocked");
-      throw new Error(`source workspace ${request.label} is ambiguous`);
-    }
-    const workspace = matches[0];
-    if (workspace === undefined) {
-      throw new Error(`source workspace delivery remains unknown for ${request.label}; request was not retried`);
-    }
-    tree = this.store.bindRepoSourceWorkspace(tree.treeId, workspace.workspace_id);
-    this.store.setOperationStatus(operation.operationId, "completed", {
-      result: { reconciled: true, workspaceId: workspace.workspace_id },
-    });
-    return tree;
-  }
-
-  private matchingSourceWorkspaces(snapshot: SessionSnapshot, tree: TreeRecord, label: string): WorkspaceInfo[] {
-    return snapshot.workspaces.filter(
-      (workspace) => workspace.label === label && workspace.worktree?.checkout_path === tree.repoRoot,
-    );
-  }
 
   private async reconcileUncertainRuntimeOperations(
     tree: TreeRecord,
     orchestrator: SheltieOrchestrator,
   ): Promise<void> {
     for (const node of this.store.listNodes(tree.treeId)) {
-      const worktreeOperation = this.store.findOperation(
-        operationIdForRequest(tree.treeId, "worktree_create", node.nodeId),
+      const runtimeOperation = this.store.findOperation(
+        operationIdForRequest(
+          tree.treeId,
+          node.placement === "tab"
+            ? "tab_create"
+            : node.parentNodeId === null
+              ? "workspace_create"
+              : "worktree_create",
+          node.nodeId,
+        ),
       );
       const agentOperation = this.store.findOperation(operationIdForRequest(tree.treeId, "agent_start", node.nodeId));
       if (
-        (node.workspaceId === null && worktreeOperation !== null && isUncertain(worktreeOperation.status)) ||
+        (node.workspaceId === null && runtimeOperation !== null && isUncertain(runtimeOperation.status)) ||
         (node.agentName === null && agentOperation !== null && isUncertain(agentOperation.status))
       ) {
         await orchestrator.reconcileNode(node.nodeId);

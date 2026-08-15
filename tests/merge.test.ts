@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { SheltieStore } from "../src/db.ts";
 import { commitAll, commitExistsOnBranch, hasMergeInProgress, initDisposableRepo, resolveCommit, runGit } from "../src/git.ts";
 import { MergeBlockedError, MergeController } from "../src/merge.ts";
+import { resolveManifestFile } from "../src/manifest.ts";
 
 const roots: string[] = [];
 
@@ -19,7 +20,7 @@ interface MergeFixture {
   childCommit: string;
 }
 
-async function createMergeFixture(options: { conflict?: boolean } = {}): Promise<MergeFixture> {
+async function createMergeFixture(options: { conflict?: boolean; mergeCapability?: boolean } = {}): Promise<MergeFixture> {
   const root = mkdtempSync(join(tmpdir(), "sheltie-merge-"));
   roots.push(root);
   const repoRoot = join(root, "repo");
@@ -41,7 +42,57 @@ async function createMergeFixture(options: { conflict?: boolean } = {}): Promise
     writeFileSync(join(childPath, "child-result.txt"), "child complete\n");
   }
   const childCommit = await commitAll(childPath, "complete child");
+  const manifestPath = join(root, "sheltie.yaml");
+  writeFileSync(manifestPath, `apiVersion: sheltie.dev/v1alpha1
+kind: Run
+metadata:
+  name: merge-test
+spec:
+  root:
+    role: parent
+    name: parent
+  limits:
+    maxDepth: 4
+    maxChildrenPerNode: 8
+    maxDescendants: 32
+    maxParallelNodes: 8
+  roles:
+    parent:
+      placement: workspace
+      agent:
+        kind: omp
+      prompt:
+        inline: |
+          merge child
+      capabilities:
+        spawn:
+          roles: [child]
+        mergeChildren: ${options.mergeCapability ?? true}
+        messaging:
+          sendTo: [children]
+          receiveFrom: [children]
+    child:
+      placement: workspace
+      agent:
+        kind: omp
+      prompt:
+        inline: |
+          complete child
+      capabilities:
+        spawn:
+          roles: []
+        mergeChildren: false
+        messaging:
+          sendTo: [parent]
+          receiveFrom: [parent]
+`);
+  const manifest = resolveManifestFile(manifestPath);
   const store = new SheltieStore(join(root, "state.sqlite"));
+  store.saveManifest({
+    manifestDigest: manifest.digest,
+    apiVersion: manifest.manifest.apiVersion,
+    resolved: manifest.manifest,
+  });
   store.createTree({
     treeId: "tree-merge",
     runId: "run-merge",
@@ -53,6 +104,8 @@ async function createMergeFixture(options: { conflict?: boolean } = {}): Promise
     baseCommit,
     worktreeRoot: root,
     rootTaskContract: "merge child",
+    manifestDigest: manifest.digest,
+    rootRole: "parent",
     status: "active",
   });
   store.reserveNode({
@@ -65,6 +118,10 @@ async function createMergeFixture(options: { conflict?: boolean } = {}): Promise
     baseCommit,
     worktreePath: parentPath,
     taskContract: "merge child",
+    roleName: "parent",
+    roleDigest: manifest.manifest.spec.roles.parent!.digest,
+    parameters: {},
+    resolvedCapabilities: manifest.manifest.spec.roles.parent!.capabilities,
   });
   store.bindWorktree("node-parent", { workspaceId: "w-parent", tabId: "w-parent:t1", paneId: "w-parent:p1" });
   store.reserveNode({
@@ -77,6 +134,10 @@ async function createMergeFixture(options: { conflict?: boolean } = {}): Promise
     baseCommit,
     worktreePath: childPath,
     taskContract: "complete child",
+    roleName: "child",
+    roleDigest: manifest.manifest.spec.roles.child!.digest,
+    parameters: {},
+    resolvedCapabilities: manifest.manifest.spec.roles.child!.capabilities,
   });
   store.bindWorktree("node-child", { workspaceId: "w-child", tabId: "w-child:t1", paneId: "w-child:p1" });
   store.reserveStep({
@@ -113,6 +174,22 @@ describe("MergeController", () => {
     expect(readFileSync(join(fixture.parentPath, "child-result.txt"), "utf8")).toBe("child complete\n");
     expect(replay.duplicate).toBe(true);
     expect(await resolveCommit(fixture.parentPath, "HEAD")).toBe(firstHead);
+    fixture.store.close();
+  });
+
+  test("rejects merge when the parent role lacks merge capability", async () => {
+    const fixture = await createMergeFixture({ mergeCapability: false });
+    const before = await resolveCommit(fixture.parentPath, "HEAD");
+
+    await expect(
+      new MergeController(fixture.store).mergeChild({
+        parentPaneId: "w-parent:p1",
+        childNodeId: "node-child",
+      }),
+    ).rejects.toThrow("role parent is not authorized to merge child branches");
+
+    expect(await resolveCommit(fixture.parentPath, "HEAD")).toBe(before);
+    expect(fixture.store.listOperations("tree-merge").filter((operation) => operation.kind === "merge")).toEqual([]);
     fixture.store.close();
   });
 

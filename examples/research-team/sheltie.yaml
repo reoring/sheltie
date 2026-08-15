@@ -1,0 +1,74 @@
+apiVersion: sheltie.dev/v1alpha1
+kind: Run
+metadata:
+  name: research-team
+spec:
+  root:
+    role: coordinator
+    name: coordinator
+  limits:
+    maxDepth: 3
+    maxChildrenPerNode: 2
+    maxDescendants: 3
+    maxParallelNodes: 4
+  roles:
+    coordinator:
+      placement: workspace
+      agent:
+        kind: omp
+      prompt:
+        file: prompts/coordinator.md
+      capabilities:
+        spawn:
+          roles: [team]
+        mergeChildren: true
+        messaging:
+          sendTo: [children]
+          receiveFrom: [children]
+      executionPolicy:
+        workspace: read-write
+    team:
+      placement: workspace
+      agent:
+        kind: omp
+      prompt:
+        file: prompts/team.md
+      capabilities:
+        spawn:
+          roles: [researcher, reviewer]
+        mergeChildren: false
+        messaging:
+          sendTo: [parent, children]
+          receiveFrom: [parent, children]
+      executionPolicy:
+        workspace: read-write
+    researcher:
+      placement: tab
+      agent:
+        kind: omp
+      prompt:
+        file: prompts/researcher.md
+      capabilities:
+        spawn:
+          roles: []
+        mergeChildren: false
+        messaging:
+          sendTo: [parent]
+          receiveFrom: [parent]
+      executionPolicy:
+        workspace: read-only
+    reviewer:
+      placement: tab
+      agent:
+        kind: omp
+      prompt:
+        file: prompts/reviewer.md
+      capabilities:
+        spawn:
+          roles: []
+        mergeChildren: false
+        messaging:
+          sendTo: [parent]
+          receiveFrom: [parent]
+      executionPolicy:
+        workspace: read-only
