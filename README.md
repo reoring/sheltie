@@ -4,6 +4,38 @@ Sheltie coordinates a manifest-declared team of OMP Agents in Herdr workspaces, 
 
 > **Experimental local PoC.** Sheltie is for local, disposable research and development workflows. It is not production-ready, is not a hosted service, and must not be used as a hard security boundary.
 
+## Why Sheltie exists
+
+Sheltie started with a simple question: can one root coding Agent recursively form a team, delegate work to child Agents, and leave behind one reviewable Git result? The desired shape was fractal-style: a root could create an isolated team, that team could create local researchers or reviewers, and the system could durably report progress, finish nodes, merge isolated branches, and recover without a human reconstructing the run from terminal scrollback.
+
+### Problem: a runtime layout is not an orchestration state
+
+Herdr already provides the runtime primitives Sheltie needs: sessions, workspaces, tabs, panes, terminals, and Agent processes. Those objects answer **where an Agent is running**. They do not, by themselves, answer **why the Agent exists**, who its logical parent is, which operation created it, whether its result is final, or whether its branch was merged.
+
+That distinction matters. Herdr workspaces are peers in the native UI, while a logical Agent tree may contain several nested levels. Prompt-only coordination is also transient: if a controller loses the response to a worktree creation, Agent start, or prompt submission, blindly repeating the request can duplicate work. A terminal that looks idle does not prove that a step completed, and a progress message does not prove that a child produced a mergeable result.
+
+### Challenges: recovery, isolation, and authority
+
+The design process and real runs exposed a mix of structural tradeoffs and concrete failure modes:
+
+- Mapping every node to a workspace preserves Git isolation, but leaves collaboration visually flat. Mapping every child to a tab looks more hierarchical, but removes branch isolation and makes concurrent writes collide.
+- The controller and Agent-facing CLI are concurrent users of the same state. An early run reproduced SQLite writer contention, so lock acquisition had to be bounded and retryable rather than assumed to succeed immediately.
+- An external mutation can enter an uncertain-delivery state when the controller loses its response. Sheltie must reconcile durable operation identity with current runtime state before any retry, and fail closed when it cannot prove one owned effect.
+- Completion needs a durable order. A child must complete its step, finish its node, and only then publish a final `result`; ordinary `progress` remains non-final.
+- A role restriction written only in a prompt is guidance, not a capability boundary. Spawn, merge, placement, messaging, and concurrency limits must be checked by the controller before mutation.
+
+### Solution: separate durable intent, runtime, and artifacts
+
+Sheltie assigns each concern one authority:
+
+- A strict YAML manifest declares roles, prompts, placement, allowed children, messaging relations, and controller-enforced capabilities before the first Herdr mutation.
+- SQLite owns the logical parent-child tree, operation identities, lifecycle transitions, inbox messages, read receipts, and recovery evidence.
+- Git owns durable artifacts: workspace children receive isolated branches and linked worktrees, while tab children share their parent's worktree. Tab work is cooperative and read-only by default; a write lease for concurrent read-write tabs is not implemented.
+- Herdr owns the live execution projection. Sheltie creates and locates Agents there, but never infers the durable logical tree from sidebar order, labels, or pane layout.
+- A versioned, allowlisted observation snapshot projects the SQLite state into the read-only Cockpit without exposing prompts, paths, sockets, Agent identities, or raw operation payloads.
+
+The resulting protocol is intentionally conservative: reserve before mutating, reconcile before retrying, fail closed on ambiguous ownership, distinguish progress from completion, and preserve the root branch as the run's deliverable. Sheltie does not yet provide A2A transport, a daemon scheduler, concurrent read-write tabs, or a hard sandbox against processes running as the same Unix user.
+
 ## What it does
 
 - Defines an Agent tree, prompts, placement, workspace policy, and messaging authority in a validated YAML manifest.
