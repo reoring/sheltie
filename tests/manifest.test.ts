@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ManifestValidationError, resolveManifestFile } from "../src/manifest.ts";
+import { ManifestValidationError, parseResolvedManifest, resolveManifestFile } from "../src/manifest.ts";
 import { requestHash } from "../src/ids.ts";
 
 const roots: string[] = [];
@@ -95,6 +95,40 @@ const TEAM_RESEARCHER_REVIEWER_MANIFEST = `${VALID_MANIFEST
           sendTo: [parent]
           receiveFrom: [parent]
 `;
+
+const COMPACTION_CAPABLE_MANIFEST = TEAM_RESEARCHER_REVIEWER_MANIFEST
+  .replace("roles: []", "roles: [reviewer]")
+  .replace("receiveFrom: [parent]", "receiveFrom: [parent, children]");
+
+const RESERVED_OMP_COMPACTION_ARGUMENTS = [
+  ["--"],
+  ["--config", "/tmp/untrusted"],
+  ["--config=/tmp/untrusted"],
+  ["--extension", "/tmp/untrusted"],
+  ["--extension=/tmp/untrusted"],
+  ["--trusted-extension", "/tmp/untrusted"],
+  ["--trusted-extension=/tmp/untrusted"],
+  ["--plugin-dir", "/tmp/untrusted"],
+  ["--plugin-dir=/tmp/untrusted"],
+  ["--profile", "untrusted"],
+  ["--profile=untrusted"],
+  ["-e", "/tmp/untrusted"],
+  ["-e=/tmp/untrusted"],
+  ["--hook", "/tmp/untrusted"],
+  ["--hook=/tmp/untrusted"],
+] as const;
+
+function compactionPolicy(roles: string, thresholdPercent: number | string = 60): string {
+  return `    compaction:
+      format: okf-v0.2
+      roles: ${roles}
+      thresholdPercent: ${thresholdPercent}
+`;
+}
+
+function withCompaction(manifest: string, compaction: string): string {
+  return manifest.replace("  roles:\n", `  knowledge:\n${compaction}  roles:\n`);
+}
 
 describe("declarative run manifest", () => {
   test("resolves prompts and capabilities into one deterministic digest", () => {
@@ -319,6 +353,243 @@ spec.roles.coordinator.capabilities.spawn.roles[0]: role "missing" does not exis
     );
   });
 
+
+  test("resolves one canonical OKF compaction policy and includes it in the manifest digest", () => {
+    const firstFixture = fixture(
+      withCompaction(COMPACTION_CAPABLE_MANIFEST, compactionPolicy("[team, researcher]", 10)),
+    );
+    const secondFixture = fixture(
+      withCompaction(COMPACTION_CAPABLE_MANIFEST, compactionPolicy("[researcher, team]", 10)),
+    );
+
+    const first = resolveManifestFile(firstFixture.manifestPath);
+    const second = resolveManifestFile(secondFixture.manifestPath);
+
+    expect(first.manifest).toMatchObject({
+      spec: {
+        knowledge: {
+          compaction: {
+            format: "okf-v0.2",
+            roles: ["researcher", "team"],
+            thresholdPercent: 10,
+          },
+        },
+      },
+    });
+    expect(second.manifest).toEqual(first.manifest);
+    expect(first.digest).toBe(requestHash(first.manifest));
+    expect(second.digest).toBe(first.digest);
+    expect(second.canonicalJson).toBe(first.canonicalJson);
+  });
+
+  test("rejects an empty compaction role selection", () => {
+    const error = validationErrorFor(
+      withCompaction(COMPACTION_CAPABLE_MANIFEST, compactionPolicy("[]")),
+    );
+
+    expect(error.issues).toEqual([
+      {
+        path: "spec.knowledge.compaction.roles",
+        message: "expected at least one role",
+      },
+    ]);
+  });
+
+  test("rejects unknown, leaf, non-OMP, and duplicate compaction roles", () => {
+    const cases = [
+      {
+        manifest: withCompaction(COMPACTION_CAPABLE_MANIFEST, compactionPolicy("[missing]")),
+        issue: {
+          path: "spec.knowledge.compaction.roles[0]",
+          message: 'role "missing" does not exist',
+        },
+      },
+      {
+        manifest: withCompaction(COMPACTION_CAPABLE_MANIFEST, compactionPolicy("[reviewer]")),
+        issue: {
+          path: "spec.knowledge.compaction.roles[0]",
+          message: 'role "reviewer" must be the root role or have one or more spawn roles',
+        },
+      },
+      {
+        manifest: withCompaction(
+          VALID_MANIFEST.replace("kind: omp", "kind: shell"),
+          compactionPolicy("[coordinator]"),
+        ),
+        issue: {
+          path: "spec.knowledge.compaction.roles[0]",
+          message: 'role "coordinator" must use agent.kind omp',
+        },
+      },
+      {
+        manifest: withCompaction(COMPACTION_CAPABLE_MANIFEST, compactionPolicy("[team, team]")),
+        issue: {
+          path: "spec.knowledge.compaction.roles",
+          message: "duplicate role",
+        },
+      },
+    ];
+
+    for (const { manifest, issue } of cases) {
+      expect(validationErrorFor(manifest).issues).toEqual([issue]);
+    }
+  });
+
+  test("accepts only integer compaction thresholds from 10 through 95", () => {
+    for (const thresholdPercent of [10, 95]) {
+      const { manifestPath } = fixture(
+        withCompaction(COMPACTION_CAPABLE_MANIFEST, compactionPolicy("[team]", thresholdPercent)),
+      );
+      expect(resolveManifestFile(manifestPath).manifest).toMatchObject({
+        spec: { knowledge: { compaction: { thresholdPercent } } },
+      });
+    }
+
+    for (const thresholdPercent of [9, 95.5, 96]) {
+      const error = validationErrorFor(
+        withCompaction(COMPACTION_CAPABLE_MANIFEST, compactionPolicy("[team]", thresholdPercent)),
+      );
+      expect(error.issues).toEqual([
+        {
+          path: "spec.knowledge.compaction.thresholdPercent",
+          message: "expected an integer from 10 to 95",
+        },
+      ]);
+    }
+  });
+
+  test("rejects unknown fields in knowledge compaction policy", () => {
+    const error = validationErrorFor(
+      withCompaction(
+        COMPACTION_CAPABLE_MANIFEST,
+        `    unexpected: true
+    compaction:
+      format: okf-v0.2
+      roles: [team]
+      thresholdPercent: 60
+      extra: true
+`,
+      ),
+    );
+
+    expect(error.issues).toEqual([
+      { path: "spec.knowledge.compaction.extra", message: "unknown field" },
+      { path: "spec.knowledge.unexpected", message: "unknown field" },
+    ]);
+  });
+
+  test("rejects reserved compaction controls for selected roles without changing unselected roles", () => {
+    const reservedArguments = [
+      "--sheltie-okf-dir=/tmp/untrusted",
+      ...RESERVED_OMP_COMPACTION_ARGUMENTS.flat(),
+    ];
+    const unselected = resolveManifestFile(
+      fixture(
+        withCompaction(
+          COMPACTION_CAPABLE_MANIFEST.replace(
+            "    reviewer:\n      placement: workspace\n      agent:\n        kind: omp",
+            `    reviewer:\n      placement: workspace\n      agent:\n        kind: omp\n        args: ${JSON.stringify(reservedArguments)}`,
+          ),
+          compactionPolicy("[team]"),
+        ),
+      ).manifestPath,
+    );
+    expect(unselected.manifest.spec.roles.reviewer?.agent.args).toEqual(reservedArguments);
+
+    for (const arguments_ of RESERVED_OMP_COMPACTION_ARGUMENTS) {
+      const error = validationErrorFor(
+        withCompaction(
+          COMPACTION_CAPABLE_MANIFEST.replace(
+            "    team:\n      placement: workspace\n      agent:\n        kind: omp",
+            `    team:\n      placement: workspace\n      agent:\n        kind: omp\n        args: ${JSON.stringify(arguments_)}`,
+          ),
+          compactionPolicy("[team]"),
+        ),
+      );
+      expect(error.issues).toEqual([
+        {
+          path: "spec.roles.team.agent.args[0]",
+          message: "reserved for knowledge compaction",
+        },
+      ]);
+    }
+  });
+
+  test("rejects persisted reserved compaction controls for selected roles", () => {
+    const { manifestPath } = fixture(COMPACTION_CAPABLE_MANIFEST);
+    const base = resolveManifestFile(manifestPath).manifest;
+    const team = base.spec.roles.team;
+    if (team === undefined) throw new Error("expected team role");
+    const persisted = {
+      ...base,
+      spec: {
+        ...base.spec,
+        knowledge: {
+          compaction: {
+            format: "okf-v0.2" as const,
+            roles: ["team"],
+            thresholdPercent: 60,
+          },
+        },
+      },
+    };
+
+    for (const arguments_ of RESERVED_OMP_COMPACTION_ARGUMENTS) {
+      expect(() =>
+        parseResolvedManifest({
+          ...persisted,
+          spec: {
+            ...persisted.spec,
+            roles: {
+              ...persisted.spec.roles,
+              team: {
+                ...team,
+                agent: {
+                  ...team.agent,
+                  args: arguments_,
+                },
+              },
+            },
+          },
+        }),
+      ).toThrow(`resolved manifest.spec.roles.team.agent.args[0]: reserved for knowledge compaction`);
+    }
+  });
+
+  test("validates persisted resolved compaction policies through parseResolvedManifest", () => {
+    const { manifestPath } = fixture(COMPACTION_CAPABLE_MANIFEST);
+    const base = resolveManifestFile(manifestPath).manifest;
+    const persisted = {
+      ...base,
+      spec: {
+        ...base.spec,
+        knowledge: {
+          compaction: {
+            format: "okf-v0.2" as const,
+            roles: ["researcher", "team"],
+            thresholdPercent: 60,
+          },
+        },
+      },
+    };
+
+    expect(parseResolvedManifest(persisted)).toEqual(persisted);
+    expect(() =>
+      parseResolvedManifest({
+        ...persisted,
+        spec: {
+          ...persisted.spec,
+          knowledge: {
+            compaction: {
+              format: "okf-v0.2",
+              roles: ["researcher", "team"],
+              thresholdPercent: 96,
+            },
+          },
+        },
+      }),
+    ).toThrow("resolved manifest.spec.knowledge.compaction.thresholdPercent: expected an integer from 10 to 95");
+  });
 
   test("rejects prompt paths that escape the manifest directory", () => {
     const { root, manifestPath } = fixture(VALID_MANIFEST.replace("prompts/root.md", "../outside.md"));

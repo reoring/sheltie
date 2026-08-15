@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createServer, type Server } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { SheltieStore } from "../src/db.ts";
 import { commitAll, initDisposableRepo, resolveCommit } from "../src/git.ts";
 import type {
@@ -14,13 +15,15 @@ import type {
   WorkspaceInfo,
   WorktreeInfo,
 } from "../src/herdr-client.ts";
-import { agentNameForNode } from "../src/ids.ts";
+import { agentNameForNode, requestHash } from "../src/ids.ts";
 import { MergeController } from "../src/merge.ts";
 import { type HerdrControl, SheltieOrchestrator } from "../src/orchestrator.ts";
 import { runCli } from "../src/cli.ts";
-import { resolveManifestFile } from "../src/manifest.ts";
+import { resolveManifestFile, type ResolvedManifestDocument } from "../src/manifest.ts";
 
 const roots: string[] = [];
+const COMPACTION_EXTENSION_SOURCE = "export default {};\n";
+
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -29,6 +32,13 @@ afterEach(() => {
 class CollaborationHerdr implements HerdrControl {
   readonly tabCreates: Record<string, unknown>[] = [];
   readonly worktreeCreates: Record<string, unknown>[] = [];
+  readonly agentStarts: {
+    name: string;
+    kind: string;
+    pane_id: string;
+    args?: string[];
+    timeout_ms?: number;
+  }[] = [];
   snapshotValue: SessionSnapshot;
 
   constructor(repoRoot: string) {
@@ -120,11 +130,18 @@ class CollaborationHerdr implements HerdrControl {
     return Promise.resolve({ type: "tab_info", tab });
   }
 
-  agentStart(params: { name: string; kind: string; pane_id: string }): Promise<{
+  agentStart(params: {
+    name: string;
+    kind: string;
+    pane_id: string;
+    args?: string[];
+    timeout_ms?: number;
+  }): Promise<{
     type: "agent_started";
     agent: AgentInfo;
     argv: string[];
   }> {
+    this.agentStarts.push(structuredClone(params));
     const pane = this.snapshotValue.panes.find((candidate) => candidate.pane_id === params.pane_id);
     if (pane === undefined) return Promise.reject(new Error(`pane ${params.pane_id} missing`));
     const started = this.agent(params.name, pane);
@@ -256,17 +273,103 @@ spec:
   return resolveManifestFile(path);
 }
 
-async function createFixture(): Promise<{
+function createCompactionPolicyManifest(root: string) {
+  const path = join(root, "sheltie.yaml");
+  writeFileSync(path, `apiVersion: sheltie.dev/v1alpha1
+kind: Run
+metadata:
+  name: collaboration-compaction-test
+spec:
+  root:
+    role: coordinator
+    name: root
+  limits:
+    maxDepth: 4
+    maxChildrenPerNode: 8
+    maxDescendants: 32
+    maxParallelNodes: 8
+  knowledge:
+    compaction:
+      format: okf-v0.2
+      roles: [reviewer]
+      thresholdPercent: 67
+  roles:
+    coordinator:
+      placement: workspace
+      agent:
+        kind: omp
+      prompt:
+        inline: |
+          coordinate tab workers
+      capabilities:
+        spawn:
+          roles: [researcher, reviewer]
+        mergeChildren: true
+        messaging:
+          sendTo: [children]
+          receiveFrom: [children]
+    researcher:
+      placement: tab
+      agent:
+        kind: omp
+        args: [--manifest-leaf-arg, researcher]
+      prompt:
+        inline: |
+          research only; send findings to parent inbox
+      capabilities:
+        spawn:
+          roles: []
+        mergeChildren: false
+        messaging:
+          sendTo: [parent]
+          receiveFrom: [parent]
+      executionPolicy:
+        workspace: read-only
+    reviewer:
+      placement: tab
+      agent:
+        kind: omp
+        args: [--manifest-parent-arg, reviewer]
+      prompt:
+        inline: |
+          review only
+      capabilities:
+        spawn:
+          roles: [reviewer]
+        mergeChildren: false
+        messaging:
+          sendTo: [parent, children]
+          receiveFrom: [parent, children]
+      executionPolicy:
+        workspace: read-only
+`);
+  return resolveManifestFile(path);
+}
+
+interface CollaborationFixtureOptions {
+  createManifest?: (root: string) => ResolvedManifestDocument;
+  okfCompactionExtensionPath?: (root: string) => string;
+}
+
+interface CollaborationFixture {
   store: SheltieStore;
   repoRoot: string;
   herdr: CollaborationHerdr;
   orchestrator: SheltieOrchestrator;
-}> {
+  okfCompactionExtensionPath?: string;
+}
+
+interface CompactionFixture extends CollaborationFixture {
+  okfCompactionExtensionPath: string;
+}
+
+async function createFixture(options: CollaborationFixtureOptions = {}): Promise<CollaborationFixture> {
   const root = mkdtempSync(join(tmpdir(), "sheltie-collaboration-"));
   roots.push(root);
   const repoRoot = join(root, "repo");
   const baseCommit = await initDisposableRepo(repoRoot);
-  const manifest = createCollaborationManifest(root);
+  const manifest = (options.createManifest ?? createCollaborationManifest)(root);
+  const okfCompactionExtensionPath = options.okfCompactionExtensionPath?.(root);
   const store = new SheltieStore(join(root, "state.sqlite"));
   store.saveManifest({
     manifestDigest: manifest.digest,
@@ -316,8 +419,30 @@ async function createFixture(): Promise<{
     sheltieExecutable: "/opt/sheltie/bin/sheltie",
     worktreeRoot: join(root, "worktrees"),
     agentReadyTimeoutMs: 100,
+    ...(okfCompactionExtensionPath === undefined ? {} : { okfCompactionExtensionPath }),
   });
-  return { store, repoRoot, herdr, orchestrator };
+  return {
+    store,
+    repoRoot,
+    herdr,
+    orchestrator,
+    ...(okfCompactionExtensionPath === undefined ? {} : { okfCompactionExtensionPath }),
+  };
+}
+
+async function createCompactionFixture(): Promise<CompactionFixture> {
+  const fixture = await createFixture({
+    createManifest: createCompactionPolicyManifest,
+    okfCompactionExtensionPath: (root) => {
+      const extensionPath = join(root, "sheltie-okf-compaction.js");
+      writeFileSync(extensionPath, COMPACTION_EXTENSION_SOURCE);
+      return extensionPath;
+    },
+  });
+  if (fixture.okfCompactionExtensionPath === undefined) {
+    throw new Error("compaction fixture did not configure an extension path");
+  }
+  return { ...fixture, okfCompactionExtensionPath: fixture.okfCompactionExtensionPath };
 }
 
 function completeStep(store: SheltieStore, nodeId: string, paneId: string, commitSha: string): void {
@@ -441,6 +566,120 @@ describe("space and tab collaboration", () => {
     expect(store.syncInbox("node-root").map((message) => message.body)).toEqual(["research complete"]);
     completeStep(store, "node-root", "w-root:p1", head);
     expect(store.finishNode("node-root", "w-root:p1").lifecycleStatus).toBe("completed");
+    store.close();
+  });
+
+  test("starts a selected parent-capable role with generated OKF controls before manifest value-taking args", async () => {
+    const { store, herdr, okfCompactionExtensionPath, orchestrator } = await createCompactionFixture();
+    const selected = await orchestrator.reserveChild({
+      parentPaneId: "w-root:p1",
+      requestKey: "compaction-reviewer",
+      name: "reviewer",
+      roleName: "reviewer",
+    });
+    const unselectedLeaf = await orchestrator.reserveChild({
+      parentPaneId: "w-root:p1",
+      requestKey: "plain-researcher",
+      name: "researcher",
+      roleName: "researcher",
+    });
+
+    const selectedProvisioned = await orchestrator.provisionNode(selected.nodeId);
+    const leafProvisioned = await orchestrator.provisionNode(unselectedLeaf.nodeId);
+    if (selectedProvisioned.paneId === null || leafProvisioned.paneId === null) {
+      throw new Error("compaction fixture nodes were not bound to panes");
+    }
+    const stateRoot = dirname(store.path);
+    const nodeHash = requestHash({ treeId: selected.treeId, nodeId: selected.nodeId }).slice(0, 16);
+    const configPath = join(stateRoot, "runtime", "okf-compaction", `${nodeHash}.yml`);
+    const outputDirectory = join(stateRoot, "knowledge", nodeHash);
+    const extensionHash = createHash("sha256").update(COMPACTION_EXTENSION_SOURCE).digest("hex");
+    const stagedExtensionPath = join(
+      stateRoot,
+      "runtime",
+      "okf-compaction",
+      "extensions",
+      `sheltie-okf-compaction-${extensionHash}.js`,
+    );
+
+    expect(
+      herdr.agentStarts.find((request) => request.name === agentNameForNode(selected.nodeId)),
+    ).toEqual({
+      name: agentNameForNode(selected.nodeId),
+      kind: "omp",
+      pane_id: selectedProvisioned.paneId,
+      args: [
+        "--config",
+        configPath,
+        "--extension",
+        stagedExtensionPath,
+        "--sheltie-okf-dir",
+        outputDirectory,
+        "--sheltie-okf-role",
+        "reviewer",
+        "--manifest-parent-arg",
+        "reviewer",
+      ],
+      timeout_ms: 60_000,
+    });
+    if (typeof process.geteuid !== "function") throw new Error("compaction fixture requires an effective uid");
+    expect(readFileSync(stagedExtensionPath, "utf8")).toBe(COMPACTION_EXTENSION_SOURCE);
+    expect(statSync(stagedExtensionPath)).toMatchObject({
+      uid: process.geteuid(),
+      mode: expect.any(Number),
+    });
+    expect(statSync(stagedExtensionPath).mode & 0o777).toBe(0o600);
+    expect(statSync(dirname(stagedExtensionPath)).mode & 0o777).toBe(0o700);
+    writeFileSync(okfCompactionExtensionPath, "export default { replaced: true };\n");
+    expect(readFileSync(stagedExtensionPath, "utf8")).toBe(COMPACTION_EXTENSION_SOURCE);
+
+    expect(Bun.YAML.parse(readFileSync(configPath, "utf8"))).toEqual({
+      compaction: {
+        enabled: true,
+        strategy: "context-full",
+        remoteEnabled: false,
+        thresholdPercent: 67,
+        thresholdTokens: -1,
+        autoContinue: true,
+      },
+    });
+
+    const leafStart = herdr.agentStarts.find((request) => request.name === agentNameForNode(unselectedLeaf.nodeId));
+    expect(leafStart).toEqual({
+      name: agentNameForNode(unselectedLeaf.nodeId),
+      kind: "omp",
+      pane_id: leafProvisioned.paneId,
+      args: ["--manifest-leaf-arg", "researcher"],
+      timeout_ms: 60_000,
+    });
+    expect(leafStart?.args?.some((argument) => argument.startsWith("--sheltie-okf-"))).toBe(false);
+
+    store.close();
+  });
+
+  test("rejects an unsafe OKF compaction extension before launching the selected agent", async () => {
+    const { store, herdr, orchestrator } = await createFixture({
+      createManifest: createCompactionPolicyManifest,
+      okfCompactionExtensionPath: (root) => {
+        const targetPath = join(root, "trusted-extension.js");
+        const unsafePath = join(root, "unsafe-extension.js");
+        writeFileSync(targetPath, COMPACTION_EXTENSION_SOURCE);
+        symlinkSync(targetPath, unsafePath);
+        return unsafePath;
+      },
+    });
+    const selected = await orchestrator.reserveChild({
+      parentPaneId: "w-root:p1",
+      requestKey: "unsafe-compaction-reviewer",
+      name: "reviewer",
+      roleName: "reviewer",
+    });
+
+    await expect(orchestrator.provisionNode(selected.nodeId)).rejects.toThrow(
+      "OKF compaction extension must not be a symbolic link",
+    );
+    expect(herdr.agentStarts).toEqual([]);
+
     store.close();
   });
 

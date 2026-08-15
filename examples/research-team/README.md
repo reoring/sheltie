@@ -23,6 +23,16 @@ researcher       reviewer
 The coordinator and team use separate workspaces. The two tab roles share the team workspace and branch, so their findings return through the durable inbox rather than through file changes. After both tabs finish, the read-write `team` child writes the reviewed packet to the small named artifact `research-team-final.md`, commits exactly that artifact, and completes its step at the new commit. The coordinator may then merge that completed workspace child, bringing the artifact into the coordinator branch. The researcher and reviewer complete at their unchanged `HEAD`; they never write, commit, or merge. The example demonstrates manifest-declared placement and capabilities, durable `progress` versus final `result` messages, completion ordering, and the different merge behavior for workspace and tab children.
 The private `.sheltie-state/` directory is runtime state, not a team artifact. It is ignored by the repository, so starting the example with `--state .sheltie-state` does not dirty the clean root worktree.
 
+## Automatic compaction knowledge
+
+`spec.knowledge.compaction` selects `coordinator` and `team` at `thresholdPercent: 70` using `okf-v0.2`. Selection is limited to unique OMP roles that are the root or can spawn children; `researcher` and `reviewer` are leaf roles and remain unselected.
+
+Selected roles use an owner-private `context-full` overlay with `remoteEnabled: false`, `thresholdPercent: 70`, `thresholdTokens: -1`, and `autoContinue: true`; OMP uses local context-full summarization and honors `session.compacting` marker context. The configured automatic-compaction extension is staged as a private copy before OMP starts, and only that staged extension is passed to OMP.
+
+During an automatic compaction, only the bounded `<sheltie-okf>...</sheltie-okf>` marker is considered. Each selected node gets a private OKF v0.2 bundle containing `index.md` and an idempotent `concepts/compaction-<digest>.md` draft concept. Concepts are private, unverified drafts with portable non-file provenance, not SQLite/run authority; the raw surrounding summary or raw transcript is never copied.
+
+Pattern screening is bounded and best-effort, not exhaustive path, credential, runtime-ID, or secret detection. Empty or oversized marker content, wikilinks, traversal/tilde/SSH path signals, credential-like patterns, JWTs, runtime IDs or UUIDs, and long token/hash-like values produce no partial concept. Processes running as the same Unix user remain outside Sheltie's hard security boundary. Knowledge or extension write failures are logged and do not abort compaction, so artifact emission may be skipped. Cleanup preserves knowledge bundles.
+
 ## Mergeable team artifact
 
 `research-team-final.md` is created in the team workspace only after the researcher and reviewer return their final results. It contains the concise reviewed packet and is the team's one authorized commit. The coordinator merges the completed team workspace through the generated protocol; the two read-only tabs remain unmerged because they share that workspace.
@@ -32,7 +42,7 @@ The private `.sheltie-state/` directory is runtime state, not a team artifact. I
 - Bun **1.3.13**, Git, and a clean disposable checkout.
 - A compatible local Herdr runtime (Herdr **0.8.0**, protocol **20**) with a reachable Unix socket. Set its path in the generic `$HERDR_SOCKET` variable.
 - An OMP Agent runtime that Herdr can start for the manifest roles.
-- The repository-built executable at `./dist/sheltie`.
+- The repository-built executable at `./dist/sheltie` and its sibling automatic-compaction extension at `./dist/sheltie-okf-compaction.js`.
 
 From the repository root, install dependencies and build the executable if needed:
 

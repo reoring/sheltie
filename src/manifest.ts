@@ -24,6 +24,16 @@ export interface ManifestLimits {
   maxDescendants: number;
   maxParallelNodes: number;
 }
+export interface ResolvedKnowledgeCompactionPolicy {
+  format: "okf-v0.2";
+  roles: string[];
+  thresholdPercent: number;
+}
+
+export interface ResolvedManifestKnowledge {
+  compaction: ResolvedKnowledgeCompactionPolicy;
+}
+
 
 export interface ResolvedParameterDefinition {
   type: ManifestParameterType;
@@ -76,6 +86,7 @@ export interface ResolvedRunManifest {
     };
     limits: ManifestLimits;
     roles: Record<string, ResolvedManifestRole>;
+    knowledge?: ResolvedManifestKnowledge;
   };
 }
 
@@ -734,6 +745,199 @@ function collectLimits(value: unknown, path: string, issues: IssueCollector): Ma
     : undefined;
 }
 
+interface KnowledgeCompactionValidation {
+  value?: ResolvedManifestKnowledge;
+  selectedRoles?: string[];
+}
+
+function collectKnowledgeCompaction(
+  value: unknown,
+  path: string,
+  issues: IssueCollector,
+): KnowledgeCompactionValidation {
+  const compaction = issues.capture(path, () => objectAt(value, path));
+  if (compaction === undefined) return {};
+
+  let valid = collectKnownFields(compaction, ["format", "roles", "thresholdPercent"], path, issues);
+  const format = issues.capture(`${path}.format`, () => {
+    const formatValue = stringAt(compaction.format, `${path}.format`);
+    if (formatValue !== "okf-v0.2") fail(`${path}.format`, "expected okf-v0.2");
+    return formatValue as ResolvedKnowledgeCompactionPolicy["format"];
+  });
+  const roles = collectStringArray(compaction.roles, `${path}.roles`, issues);
+  let selectedRoles: string[] | undefined;
+  if (roles === undefined) {
+    valid = false;
+  } else {
+    let validRoleNames = true;
+    if (roles.length === 0) {
+      issues.add(`${path}.roles`, "expected at least one role");
+      validRoleNames = false;
+    }
+    for (const [index, role] of roles.entries()) {
+      if (issues.capture(`${path}.roles[${index}]`, () => assertName(role, `${path}.roles[${index}]`)) === undefined) {
+        validRoleNames = false;
+      }
+    }
+    if (new Set(roles).size !== roles.length) {
+      issues.add(`${path}.roles`, "duplicate role");
+      validRoleNames = false;
+    }
+    if (validRoleNames) selectedRoles = roles;
+    else valid = false;
+  }
+
+  const thresholdPercent = issues.capture(`${path}.thresholdPercent`, () =>
+    integerAt(compaction.thresholdPercent, `${path}.thresholdPercent`, 10, 95));
+  if (format === undefined || thresholdPercent === undefined) valid = false;
+
+  return valid && format !== undefined && roles !== undefined && thresholdPercent !== undefined
+    ? {
+      value: {
+        compaction: {
+          format,
+          roles: roles.toSorted(),
+          thresholdPercent,
+        },
+      },
+      ...(selectedRoles === undefined ? {} : { selectedRoles }),
+    }
+    : { ...(selectedRoles === undefined ? {} : { selectedRoles }) };
+}
+
+function collectKnowledge(
+  value: unknown,
+  path: string,
+  issues: IssueCollector,
+): KnowledgeCompactionValidation {
+  const knowledge = issues.capture(path, () => objectAt(value, path));
+  if (knowledge === undefined) return {};
+
+  let valid = collectKnownFields(knowledge, ["compaction"], path, issues);
+  const compaction = collectKnowledgeCompaction(knowledge.compaction, `${path}.compaction`, issues);
+  if (compaction.value === undefined) valid = false;
+
+  return valid && compaction.value !== undefined
+    ? {
+      value: compaction.value,
+      ...(compaction.selectedRoles === undefined ? {} : { selectedRoles: compaction.selectedRoles }),
+    }
+    : { ...(compaction.selectedRoles === undefined ? {} : { selectedRoles: compaction.selectedRoles }) };
+}
+
+function isReservedKnowledgeCompactionArgument(argument: string): boolean {
+  return argument === "--" ||
+    argument.startsWith("--sheltie-okf-") ||
+    argument === "--config" ||
+    argument.startsWith("--config=") ||
+    argument === "--extension" ||
+    argument.startsWith("--extension=") ||
+    argument === "--trusted-extension" ||
+    argument.startsWith("--trusted-extension=") ||
+    argument === "--plugin-dir" ||
+    argument.startsWith("--plugin-dir=") ||
+    argument === "--profile" ||
+    argument.startsWith("--profile=") ||
+    argument === "-e" ||
+    argument.startsWith("-e=") ||
+    argument === "--hook" ||
+    argument.startsWith("--hook=");
+}
+
+function collectCompactionRoleConstraints(
+  selectedRoles: readonly string[],
+  rootRole: string | undefined,
+  rolesValue: Record<string, unknown>,
+  roles: ReadonlyMap<string, RoleValidation>,
+  issues: IssueCollector,
+): void {
+  for (const [index, roleName] of selectedRoles.entries()) {
+    const rolePath = `spec.knowledge.compaction.roles[${index}]`;
+    if (!Object.hasOwn(rolesValue, roleName)) {
+      issues.add(rolePath, `role "${roleName}" does not exist`);
+      continue;
+    }
+
+    const role = roles.get(roleName)?.value;
+    if (role === undefined) continue;
+    if (role.agent.kind !== "omp") {
+      issues.add(rolePath, `role "${roleName}" must use agent.kind omp`);
+    }
+    if (roleName !== rootRole && role.capabilities.spawn.roles.length === 0) {
+      issues.add(rolePath, `role "${roleName}" must be the root role or have one or more spawn roles`);
+    }
+    for (const [argumentIndex, argument] of role.agent.args.entries()) {
+      if (isReservedKnowledgeCompactionArgument(argument)) {
+        issues.add(
+          `spec.roles.${roleName}.agent.args[${argumentIndex}]`,
+          "reserved for knowledge compaction",
+        );
+      }
+    }
+  }
+}
+
+function parseResolvedKnowledge(
+  value: unknown,
+  path: string,
+  rootRole: string,
+  roles: Record<string, unknown>,
+): void {
+  if (value === undefined) return;
+
+  const knowledge = objectAt(value, path);
+  for (const field of Object.keys(knowledge).sort()) {
+    if (field !== "compaction") fail(`${path}.${field}`, "unknown field");
+  }
+
+  const compactionPath = `${path}.compaction`;
+  const compaction = objectAt(knowledge.compaction, compactionPath);
+  for (const field of Object.keys(compaction).sort()) {
+    if (field !== "format" && field !== "roles" && field !== "thresholdPercent") {
+      fail(`${compactionPath}.${field}`, "unknown field");
+    }
+  }
+
+  const format = stringAt(compaction.format, `${compactionPath}.format`);
+  if (format !== "okf-v0.2") fail(`${compactionPath}.format`, "expected okf-v0.2");
+  if (!Array.isArray(compaction.roles)) fail(`${compactionPath}.roles`, "expected an array");
+  const selectedRoles = compaction.roles.map((role, index) =>
+    assertName(stringAt(role, `${compactionPath}.roles[${index}]`), `${compactionPath}.roles[${index}]`));
+  if (new Set(selectedRoles).size !== selectedRoles.length) {
+    fail(`${compactionPath}.roles`, "duplicate role");
+  }
+  if (selectedRoles.length === 0) fail(`${compactionPath}.roles`, "expected at least one role");
+  integerAt(compaction.thresholdPercent, `${compactionPath}.thresholdPercent`, 10, 95);
+
+  for (const [index, roleName] of selectedRoles.entries()) {
+    const rolePath = `${compactionPath}.roles[${index}]`;
+    const roleValue = roles[roleName];
+    if (roleValue === undefined) fail(rolePath, `role "${roleName}" does not exist`);
+
+    const role = objectAt(roleValue, `resolved manifest.spec.roles.${roleName}`);
+    const agent = objectAt(role.agent, `resolved manifest.spec.roles.${roleName}.agent`);
+    if (agent.kind !== "omp") fail(rolePath, `role "${roleName}" must use agent.kind omp`);
+
+    const capabilities = objectAt(role.capabilities, `resolved manifest.spec.roles.${roleName}.capabilities`);
+    const spawn = objectAt(capabilities.spawn, `resolved manifest.spec.roles.${roleName}.capabilities.spawn`);
+    if (roleName !== rootRole && (!Array.isArray(spawn.roles) || spawn.roles.length === 0)) {
+      fail(rolePath, `role "${roleName}" must be the root role or have one or more spawn roles`);
+    }
+
+    if (Array.isArray(agent.args)) {
+      for (const [argumentIndex, argument] of agent.args.entries()) {
+        if (typeof argument === "string" && isReservedKnowledgeCompactionArgument(argument)) {
+          fail(
+            `resolved manifest.spec.roles.${roleName}.agent.args[${argumentIndex}]`,
+            "reserved for knowledge compaction",
+          );
+        }
+      }
+    }
+  }
+}
+
+
 export function resolveManifestFile(path: string): ResolvedManifestDocument {
   let sourcePath = "";
   let source = "";
@@ -769,6 +973,8 @@ export function resolveManifestFile(path: string): ResolvedManifestDocument {
   let rootRole: string | undefined;
   let rootName: string | undefined;
   let limits: ManifestLimits | undefined;
+  let knowledge: ResolvedManifestKnowledge | undefined;
+  let selectedCompactionRoles: string[] | undefined;
   let rolesValue: Record<string, unknown> | undefined;
   let roleNames: string[] = [];
   const roles = new Map<string, RoleValidation>();
@@ -789,7 +995,7 @@ export function resolveManifestFile(path: string): ResolvedManifestDocument {
 
     const spec = documentIssues.capture("spec", () => objectAt(root.spec, "spec"));
     if (spec !== undefined) {
-      collectKnownFields(spec, ["root", "limits", "roles"], "spec", documentIssues);
+      collectKnownFields(spec, ["root", "limits", "knowledge", "roles"], "spec", documentIssues);
       const rootSpec = documentIssues.capture("spec.root", () => objectAt(spec.root, "spec.root"));
       if (rootSpec !== undefined) {
         collectKnownFields(rootSpec, ["role", "name"], "spec.root", documentIssues);
@@ -799,6 +1005,11 @@ export function resolveManifestFile(path: string): ResolvedManifestDocument {
           assertName(stringAt(rootSpec.name, "spec.root.name"), "spec.root.name"));
       }
       limits = collectLimits(spec.limits, "spec.limits", documentIssues);
+      if (spec.knowledge !== undefined) {
+        const collectedKnowledge = collectKnowledge(spec.knowledge, "spec.knowledge", documentIssues);
+        knowledge = collectedKnowledge.value;
+        selectedCompactionRoles = collectedKnowledge.selectedRoles;
+      }
       rolesValue = documentIssues.capture("spec.roles", () => objectAt(spec.roles, "spec.roles"));
       if (rolesValue !== undefined) {
         roleNames = Object.keys(rolesValue).sort();
@@ -851,6 +1062,15 @@ export function resolveManifestFile(path: string): ResolvedManifestDocument {
       roles,
       crossReferenceIssues,
     );
+    if (selectedCompactionRoles !== undefined) {
+      collectCompactionRoleConstraints(
+        selectedCompactionRoles,
+        rootRole,
+        rolesValue,
+        roles,
+        crossReferenceIssues,
+      );
+    }
   }
 
   const issues = [
@@ -880,7 +1100,12 @@ export function resolveManifestFile(path: string): ResolvedManifestDocument {
     apiVersion: MANIFEST_API_VERSION,
     kind: MANIFEST_KIND,
     metadata: { name: metadataName },
-    spec: { root: { role: rootRole, name: rootName }, limits, roles: resolvedRoles },
+    spec: {
+      root: { role: rootRole, name: rootName },
+      limits,
+      roles: resolvedRoles,
+      ...(knowledge === undefined ? {} : { knowledge }),
+    },
   };
   const json = canonicalJson(manifest);
   return { digest: requestHash(manifest), canonicalJson: json, manifest, sourcePath };
@@ -896,6 +1121,12 @@ export function parseResolvedManifest(value: unknown): ResolvedRunManifest {
   const root = objectAt(spec.root, "resolved manifest.spec.root");
   const rootRole = stringAt(root.role, "resolved manifest.spec.root.role");
   if (roles[rootRole] === undefined) throw new Error(`resolved manifest root role ${rootRole} is missing`);
+  parseResolvedKnowledge(
+    spec.knowledge,
+    "resolved manifest.spec.knowledge",
+    rootRole,
+    roles,
+  );
   return value as unknown as ResolvedRunManifest;
 }
 
