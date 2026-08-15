@@ -6,6 +6,11 @@ spec:
   root:
     role: coordinator
     name: coordinator
+  knowledge:
+    compaction:
+      format: okf-v0.2
+      roles: [coordinator, team]
+      thresholdPercent: 70
   limits:
     maxDepth: 3
     maxChildrenPerNode: 2

@@ -86,7 +86,25 @@ bun install
 bun run build
 ```
 
-The build writes the executable to `dist/sheltie`.
+The build writes the executable to `dist/sheltie` and the sibling bundled automatic-compaction extension to `dist/sheltie-okf-compaction.js`.
+
+## Automatic compaction knowledge
+
+A manifest may opt a sorted, unique list of root or parent-capable `agent.kind: omp` roles into private automatic-compaction preservation:
+
+```yaml
+knowledge:
+  compaction:
+    format: okf-v0.2
+    roles: [coordinator, team]
+    thresholdPercent: 70
+```
+
+Selected roles receive an owner-private `context-full` overlay with `remoteEnabled: false`, the manifest threshold, `thresholdTokens: -1`, and `autoContinue: true`; OMP therefore uses local context-full summarization and honors `session.compacting` marker context. The configured automatic-compaction extension is staged as a private copy before OMP starts, and only that staged extension is passed to OMP.
+
+While an automatic compaction is active, the staged extension asks for a bounded `<sheltie-okf>...</sheltie-okf>` marker and extracts only that marker. For each selected node it writes a private OKF v0.2 bundle: `index.md` and an idempotent `concepts/compaction-<digest>.md` concept with portable, non-file provenance. Concepts are private, unverified drafts rather than logical or run authority; SQLite remains authoritative, and the raw surrounding summary or raw transcript is never copied.
+
+Pattern screening is bounded and best-effort, not exhaustive path, credential, runtime-ID, or secret detection. Empty or oversized markers, wikilinks, traversal/tilde/SSH path signals, credential-like patterns, JWTs, runtime IDs or UUIDs, and long token/hash-like values fail closed without partial output. Processes running as the same Unix user remain outside Sheltie's hard security boundary. Knowledge or extension write failures are logged without aborting compaction, so artifact emission may be skipped. Cleanup preserves these private knowledge bundles.
 
 ## Quickstart: research team
 

@@ -28,6 +28,7 @@ import {
   type ResolvedRunManifest,
   spawnPolicyForRole,
 } from "./manifest.ts";
+import { defaultOkfCompactionExtensionPath, prepareOkfCompactionRuntime } from "./okf-compaction-runtime.ts";
 
 export interface HerdrControl {
   ping(): Promise<PongResult>;
@@ -103,6 +104,7 @@ export interface OrchestratorOptions {
   maxDescendants?: number;
   agentReadyTimeoutMs?: number;
   failpoint?: (name: FailpointName, operationId: string) => void | Promise<void>;
+  okfCompactionExtensionPath?: string;
 }
 
 export class RuntimeReconcileError extends Error {
@@ -295,11 +297,36 @@ export class SheltieOrchestrator {
       if (node.paneId === null) throw new Error(`node ${node.nodeId} has no pane after worktree provisioning`);
       const name = agentNameForNode(node.nodeId);
       const role = this.roleForNode(node, tree);
+      const compactionPolicy = role === null ? undefined : this.manifestForTree(tree)?.spec.knowledge?.compaction;
+      const compactionRuntime =
+        role !== null && compactionPolicy !== undefined && compactionPolicy.roles.includes(role.name)
+          ? prepareOkfCompactionRuntime({
+            stateDatabasePath: this.store.path,
+            treeId: node.treeId,
+            nodeId: node.nodeId,
+            thresholdPercent: compactionPolicy.thresholdPercent,
+            extensionPath:
+              this.options.okfCompactionExtensionPath ?? defaultOkfCompactionExtensionPath(this.options.sheltieExecutable),
+          })
+          : null;
       const request = {
         name,
         kind: role?.agent.kind ?? this.agentKind,
         pane_id: node.paneId,
-        args: role?.agent.args ?? [],
+        args:
+          compactionRuntime === null
+            ? (role?.agent.args ?? [])
+            : [
+              "--config",
+              compactionRuntime.configPath,
+              "--extension",
+              compactionRuntime.extensionPath,
+              "--sheltie-okf-dir",
+              compactionRuntime.outputDirectory,
+              "--sheltie-okf-role",
+              role!.name,
+              ...role!.agent.args,
+            ],
         timeout_ms: 60_000,
       };
       const operation = this.store.reserveOperation({
