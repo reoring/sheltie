@@ -527,7 +527,7 @@ describe("space and tab collaboration", () => {
       expect.objectContaining({
         workspace_id: "w-root",
         cwd: repoRoot,
-        label: `researcher-${child.nodeId.slice(-8)}`,
+        label: `researcher · ${child.nodeId}`,
       }),
     ]);
     store.sendMessage({
@@ -854,8 +854,8 @@ describe("space and tab collaboration", () => {
 
     expect(reconciled).toMatchObject({ placement: "tab", workspaceId: "w-root", tabId: "w-root:t3" });
     expect(herdr.tabCreates.map((request) => request.label)).toEqual([
-      `reviewer-${parentTab.nodeId.slice(-8)}`,
-      `reviewer-${nestedTab.nodeId.slice(-8)}`,
+      `reviewer · ${parentTab.nodeId}`,
+      `reviewer · ${nestedTab.nodeId}`,
     ]);
     expect(store.listUnresolvedOperations("tree-collaboration")).toEqual([]);
     store.close();
