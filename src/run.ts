@@ -22,7 +22,12 @@ export interface RealRunControllerOptions {
   sheltieExecutable: string;
   okfCompactionExtensionPath?: string;
   workspaceEnvironment?: Record<string, string>;
-  onTreeReserved?: (tree: TreeRecord) => void;
+  onTreeReserved?: (tree: TreeRecord) => void | Promise<void>;
+}
+
+export interface ExpectedRuntimeIdentity {
+  version: string;
+  protocol: number;
 }
 
 export interface StartRunInput {
@@ -33,6 +38,7 @@ export interface StartRunInput {
   manifest: ResolvedManifestDocument;
   herdrSocketPath: string;
   runtimeBinding?: RuntimeBinding;
+  expectedRuntimeIdentity?: ExpectedRuntimeIdentity;
 }
 
 /**
@@ -78,7 +84,7 @@ export class RealRunController {
     const runId = input.runId.trim();
     if (runId.length === 0 || runId.length > 128) throw new Error("runId must contain 1-128 characters");
     const rootRole = getManifestRole(input.manifest.manifest, input.manifest.manifest.spec.root.role);
-    const pong = await this.verifyRuntime();
+    const runtimeIdentity = await this.runtimeIdentityForReservation(input);
     const repoRoot = realpathSync(input.repoRoot);
     if (!(await isCleanWorktree(repoRoot))) {
       throw new Error(`repository source ${repoRoot} must be clean before starting a run`);
@@ -97,8 +103,8 @@ export class RealRunController {
         repoRoot,
         repoSourceWorkspaceId: null,
         herdrSocketPath: input.herdrSocketPath,
-        herdrVersion: pong.version,
-        herdrProtocol: pong.protocol,
+        herdrVersion: runtimeIdentity.version,
+        herdrProtocol: runtimeIdentity.protocol,
         ...(input.runtimeBinding === undefined ? {} : { runtimeBinding: input.runtimeBinding }),
         baseCommit,
         worktreeRoot: input.worktreeRoot,
@@ -109,7 +115,7 @@ export class RealRunController {
         status: "initializing",
       },
     );
-    this.options.onTreeReserved?.(tree);
+    await this.options.onTreeReserved?.(tree);
     return this.resumeBootstrap();
   }
 
@@ -235,6 +241,25 @@ export class RealRunController {
     }
     if (branchHead === null) await runGit(tree.repoRoot, ["switch", "-c", branch, tree.baseCommit]);
     else await runGit(tree.repoRoot, ["switch", branch]);
+  }
+
+  private async runtimeIdentityForReservation(input: StartRunInput): Promise<ExpectedRuntimeIdentity> {
+    const binding = input.runtimeBinding;
+    if (binding?.mode !== "bundled") {
+      if (input.expectedRuntimeIdentity !== undefined) {
+        throw new Error("expected runtime identity is valid only with a bundled runtime binding");
+      }
+      const pong = await this.verifyRuntime();
+      return { version: pong.version, protocol: pong.protocol };
+    }
+    const expected = input.expectedRuntimeIdentity;
+    if (expected === undefined) {
+      throw new Error("bundled run start requires a trusted expected runtime identity");
+    }
+    if (expected.version !== binding.herdr.version || expected.protocol !== binding.herdr.protocol) {
+      throw new Error("expected runtime identity does not match the bundled runtime binding");
+    }
+    return { version: binding.herdr.version, protocol: binding.herdr.protocol };
   }
 
   private async verifyRuntime(expected?: TreeRecord): Promise<PongResult> {

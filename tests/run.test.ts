@@ -16,6 +16,12 @@ import type {
 import { branchForNode, operationIdForRequest, requestHash } from "../src/ids.ts";
 import { RealRunController, type RunHerdrControl } from "../src/run.ts";
 import { resolveManifestFile } from "../src/manifest.ts";
+import {
+  REQUIRED_V0_HERDR_SOURCE_COMMIT,
+  REQUIRED_V0_OMP_SOURCE_COMMIT,
+  parseRuntimeBinding,
+  type BundledRuntimeBinding,
+} from "../src/runtime-bundle.ts";
 
 const roots: string[] = [];
 
@@ -69,6 +75,39 @@ spec:
           receiveFrom: [parent]
 `);
   return resolveManifestFile(path);
+}
+
+function bundledBinding(root: string): BundledRuntimeBinding {
+  const bundleRoot = join(root, "bundle");
+  const configHome = join(root, "runtime");
+  const sessionName = `s-${"a".repeat(16)}`;
+  const binding = parseRuntimeBinding({
+    mode: "bundled",
+    bundleRoot,
+    bundleDigest: "a".repeat(64),
+    bundleTarget: "linux-x64",
+    sessionName,
+    configHome,
+    socketPath: join(configHome, "herdr", "sessions", sessionName, "herdr.sock"),
+    pathPrefix: bundleRoot,
+    sheltie: { path: join(bundleRoot, "sheltie"), sha256: "b".repeat(64) },
+    herdr: {
+      path: join(bundleRoot, "herdr"),
+      sha256: "c".repeat(64),
+      sourceCommit: REQUIRED_V0_HERDR_SOURCE_COMMIT,
+      version: "0.8.0",
+      protocol: 20,
+    },
+    omp: {
+      path: join(bundleRoot, "omp"),
+      sha256: "d".repeat(64),
+      sourceCommit: REQUIRED_V0_OMP_SOURCE_COMMIT,
+      version: "0.8.0",
+    },
+    okfCompaction: { path: join(bundleRoot, "sheltie-okf-compaction.js"), sha256: "e".repeat(64) },
+  });
+  if (binding.mode !== "bundled") throw new Error("bundled test binding was not parsed as bundled");
+  return binding;
 }
 
 function pane(workspaceId: string, paneId: string): PaneInfo {
@@ -224,6 +263,7 @@ describe("RealRunController", () => {
         expect(store.getManifest(manifest.digest)?.resolved).toEqual(manifest.manifest);
         expect(tree.runtimeBinding).toEqual({ mode: "external" });
         expect(fake.workspaceCreateCalls).toBe(0);
+        expect(fake.pingCalls).toBe(1);
       },
     });
 
@@ -540,4 +580,112 @@ describe("RealRunController", () => {
     expect((await controller.convergeOnce()).tree.status).toBe("completed");
     store.close();
   });
-});
+
+  test("retains a bundled reservation when its awaited runtime callback fails", async () => {
+    const root = mkdtempSync(join(tmpdir(), "sheltie-real-run-bundled-callback-"));
+    roots.push(root);
+    const repoRoot = join(root, "repo");
+    await initDisposableRepo(repoRoot);
+    const store = new SheltieStore(join(root, "state.sqlite"));
+    const fake = new FakeRunHerdr();
+    const manifest = createManifest(root);
+    const binding = bundledBinding(root);
+    let callbackCalls = 0;
+    const controller = new RealRunController(store, fake, {
+      sheltieExecutable: binding.sheltie.path,
+      onTreeReserved: async (tree) => {
+        callbackCalls += 1;
+        expect(tree.status).toBe("initializing");
+        throw new Error("bundled runtime startup failed");
+      },
+    });
+
+    await expect(
+      controller.startRun({
+        runId: "run-bundled-callback",
+        repoRoot,
+        base: "HEAD",
+        worktreeRoot: join(root, "worktrees"),
+        manifest,
+        herdrSocketPath: binding.socketPath,
+        runtimeBinding: binding,
+        expectedRuntimeIdentity: { version: binding.herdr.version, protocol: binding.herdr.protocol },
+      }),
+    ).rejects.toThrow("bundled runtime startup failed");
+
+    const reserved = store.getOnlyTree();
+    expect(callbackCalls).toBe(1);
+    expect(fake.pingCalls).toBe(0);
+    expect(reserved).toMatchObject({
+      runtimeBinding: binding,
+      status: "initializing",
+      herdrVersion: binding.herdr.version,
+      herdrProtocol: binding.herdr.protocol,
+    });
+    expect(store.findRootNode(reserved.treeId)).toBeNull();
+
+    const resumed = new RealRunController(store, fake, { sheltieExecutable: binding.sheltie.path });
+    expect(await resumed.resumeBootstrap()).toMatchObject({ treeId: reserved.treeId, status: "active" });
+    expect(fake.pingCalls).toBe(1);
+    store.close();
+  });
+
+  test("lets only one concurrent bundled reservation reach runtime startup", async () => {
+    const root = mkdtempSync(join(tmpdir(), "sheltie-real-run-bundled-concurrent-"));
+    roots.push(root);
+    const repoRoot = join(root, "repo");
+    await initDisposableRepo(repoRoot);
+    const store = new SheltieStore(join(root, "state.sqlite"));
+    const fake = new FakeRunHerdr();
+    const manifest = createManifest(root);
+    const binding = bundledBinding(root);
+    const runtimeStarted = Promise.withResolvers<void>();
+    const releaseRuntime = Promise.withResolvers<void>();
+    const starterIds: string[] = [];
+    let ensureCalls = 0;
+    let stopCalls = 0;
+    const runtime = {
+      ensureRunning: async (starterId: string) => {
+        starterIds.push(starterId);
+        ensureCalls += 1;
+        runtimeStarted.resolve();
+        await releaseRuntime.promise;
+      },
+      stop: async () => {
+        stopCalls += 1;
+      },
+    };
+    const startInput = {
+      runId: "run-bundled-concurrent",
+      repoRoot,
+      base: "HEAD",
+      worktreeRoot: join(root, "worktrees"),
+      manifest,
+      herdrSocketPath: binding.socketPath,
+      runtimeBinding: binding,
+      expectedRuntimeIdentity: { version: binding.herdr.version, protocol: binding.herdr.protocol },
+    };
+    const firstController = new RealRunController(store, fake, {
+      sheltieExecutable: binding.sheltie.path,
+      onTreeReserved: () => runtime.ensureRunning("first"),
+    });
+    const secondController = new RealRunController(store, fake, {
+      sheltieExecutable: binding.sheltie.path,
+      onTreeReserved: () => runtime.ensureRunning("second"),
+    });
+
+    const first = firstController.startRun(startInput);
+    const second = secondController.startRun(startInput);
+    await runtimeStarted.promise;
+    releaseRuntime.resolve();
+    const results = await Promise.allSettled([first, second]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(ensureCalls).toBe(1);
+    expect(starterIds).toHaveLength(1);
+    expect(stopCalls).toBe(0);
+    expect(store.getOnlyTree()).toMatchObject({ status: "active", runtimeBinding: binding });
+    store.close();
+  });
+  });

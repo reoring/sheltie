@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SheltieStore } from "../src/db.ts";
+import { requestHash } from "../src/ids.ts";
 import { resolveManifestFile } from "../src/manifest.ts";
 import { OBSERVATION_API_VERSION, OBSERVATION_KIND, ObservationReader } from "../src/observation.ts";
 
@@ -23,6 +24,11 @@ spec:
     maxChildrenPerNode: 8
     maxDescendants: 32
     maxParallelNodes: 8
+  knowledge:
+    compaction:
+      format: okf-v0.2
+      roles: [coordinator, worker]
+      thresholdPercent: 67
   roles:
     coordinator:
       placement: workspace
@@ -266,6 +272,39 @@ function createFixture(): Fixture {
     },
   };
 }
+type StoredManifest = {
+  spec: {
+    knowledge: {
+      compaction: Record<string, unknown>;
+    };
+    roles: Record<string, { agent: { kind: string; args: string[] } }>;
+  };
+};
+
+function rewriteStoredManifest(fixture: Fixture, mutate: (manifest: StoredManifest) => void): void {
+  const database = new Database(fixture.statePath, { strict: true });
+  try {
+    const row = database
+      .query("SELECT resolved_json AS resolvedJson FROM manifests WHERE manifest_digest = ?")
+      .get(fixture.manifestDigest) as { resolvedJson: unknown } | null;
+    if (row === null || typeof row.resolvedJson !== "string") {
+      throw new Error("observation fixture manifest is missing");
+    }
+    const manifest = JSON.parse(row.resolvedJson) as StoredManifest;
+    mutate(manifest);
+    const digest = requestHash(manifest);
+    database.exec("PRAGMA foreign_keys = OFF");
+    database
+      .query("UPDATE manifests SET manifest_digest = ?, resolved_json = ? WHERE manifest_digest = ?")
+      .run(digest, JSON.stringify(manifest), fixture.manifestDigest);
+    database
+      .query("UPDATE trees SET manifest_digest = ? WHERE manifest_digest = ?")
+      .run(digest, fixture.manifestDigest);
+  } finally {
+    database.close();
+  }
+}
+
 
 function durableState(path: string): {
   counts: Record<DurableTable, number>;
@@ -482,6 +521,67 @@ describe("ObservationReader", () => {
     expect(() => new ObservationReader(depthFixture.stateDirectory).snapshot()).toThrow("parent/depth integrity check failed");
   });
 
+  test("fails closed for malformed stored knowledge", () => {
+    const cases: Array<[(manifest: StoredManifest) => void, string]> = [
+      [
+        ({ spec }) => {
+          spec.knowledge.compaction.extra = true;
+        },
+        "resolved manifest.spec.knowledge.compaction.extra: unknown field",
+      ],
+      [
+        ({ spec }) => {
+          spec.knowledge.compaction.format = "okf-v0.1";
+        },
+        "resolved manifest.spec.knowledge.compaction.format: expected okf-v0.2",
+      ],
+      [
+        ({ spec }) => {
+          spec.knowledge.compaction.roles = ["missing"];
+        },
+        'resolved manifest.spec.knowledge.compaction.roles[0]: role "missing" does not exist',
+      ],
+      [
+        ({ spec }) => {
+          spec.knowledge.compaction.roles = ["worker", "worker"];
+        },
+        "resolved manifest.spec.knowledge.compaction.roles: duplicate role",
+      ],
+      [
+        ({ spec }) => {
+          spec.knowledge.compaction.roles = ["reviewer"];
+        },
+        'resolved manifest.spec.knowledge.compaction.roles[0]: role "reviewer" must be the root role or have one or more spawn roles',
+      ],
+      [
+        ({ spec }) => {
+          spec.roles.coordinator!.agent.kind = "shell";
+        },
+        'resolved manifest.spec.knowledge.compaction.roles[0]: role "coordinator" must use agent.kind omp',
+      ],
+      [
+        ({ spec }) => {
+          spec.roles.coordinator!.agent.args = ["--config", "/tmp/untrusted"];
+        },
+        "resolved manifest.spec.roles.coordinator.agent.args[0]: reserved for knowledge compaction",
+      ],
+      [
+        ({ spec }) => {
+          spec.knowledge.compaction.thresholdPercent = 96;
+        },
+        "resolved manifest.spec.knowledge.compaction.thresholdPercent: expected an integer from 10 to 95",
+      ],
+    ];
+
+    for (const [mutate, error] of cases) {
+      const fixture = createFixture();
+      rewriteStoredManifest(fixture, mutate);
+      expect(() => new ObservationReader(fixture.stateDirectory).snapshot()).toThrow(
+        `observation snapshot is unavailable: ${error}`,
+      );
+    }
+  });
+
   test("uses a write-impossible connection and leaves durable state and receipts unchanged", () => {
     const fixture = createFixture();
     const before = durableState(fixture.statePath);
@@ -498,11 +598,12 @@ describe("ObservationReader", () => {
     }
   });
 
-  test("never returns prompt, path, runtime locator, task, payload, parameter, or credential values", () => {
+  test("never returns prompt, argument, path, runtime locator, task, payload, parameter, credential, or knowledge controls", () => {
     const fixture = createFixture();
-    const serialized = JSON.stringify(
-      new ObservationReader(fixture.stateDirectory, () => new Date(FIXED_OBSERVED_AT)).snapshot(),
-    );
+    const snapshot = new ObservationReader(fixture.stateDirectory, () => new Date(FIXED_OBSERVED_AT)).snapshot();
+    const serialized = JSON.stringify(snapshot);
+
+    expect(Object.keys(snapshot.manifest).sort()).toEqual(["apiVersion", "digest", "limits", "name", "roles", "root"]);
 
     for (const forbidden of [
       "PROMPT_BODY_MUST_NOT_LEAK",
@@ -528,6 +629,10 @@ describe("ObservationReader", () => {
       "PARAMETER_VALUE_MUST_NOT_LEAK",
       "CREDENTIAL_MUST_NOT_LEAK",
       "COMPLETED_OPERATION_RESULT_MUST_NOT_LEAK",
+      "okf-v0.2",
+      '"compaction"',
+      '"thresholdPercent"',
+      '"knowledge"',
     ]) {
       expect(serialized).not.toContain(forbidden);
     }

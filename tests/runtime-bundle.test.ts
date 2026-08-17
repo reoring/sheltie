@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -14,7 +15,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  REQUIRED_V0_HERDR_PROTOCOL,
   REQUIRED_V0_HERDR_SOURCE_COMMIT,
+  REQUIRED_V0_HERDR_VERSION,
   REQUIRED_V0_OMP_SOURCE_COMMIT,
   assertRuntimeBundleMatchesBinding,
   RUNTIME_BUNDLE_API_VERSION,
@@ -192,6 +195,51 @@ describe("runtime bundle resolution", () => {
     );
   });
 
+  test("accepts only the exact v0 Herdr version and protocol in manifests and bindings", () => {
+    const root = temporaryRoot("sheltie-runtime-herdr-identity-");
+    const manifestBundle = createBundle(root, "manifest");
+    const manifestPath = join(manifestBundle, "runtime-manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as RuntimeBundleManifest;
+    manifest.artifacts.herdr.version = "0.8.1";
+    writeFileSync(manifestPath, JSON.stringify(manifest), { mode: 0o644 });
+
+    expect(() => resolveRuntimeBundle({ sheltieExecutable: join(manifestBundle, "sheltie") })).toThrow(
+      REQUIRED_V0_HERDR_VERSION,
+    );
+
+    const protocolBundle = createBundle(root, "protocol");
+    const protocolManifestPath = join(protocolBundle, "runtime-manifest.json");
+    const protocolManifest = JSON.parse(readFileSync(protocolManifestPath, "utf8")) as RuntimeBundleManifest;
+    protocolManifest.artifacts.herdr.protocol = REQUIRED_V0_HERDR_PROTOCOL + 1;
+    writeFileSync(protocolManifestPath, JSON.stringify(protocolManifest), { mode: 0o644 });
+
+    expect(() => resolveRuntimeBundle({ sheltieExecutable: join(protocolBundle, "sheltie") })).toThrow(
+      String(REQUIRED_V0_HERDR_PROTOCOL),
+    );
+
+    const stateRoot = join(root, "state");
+    mkdirSync(stateRoot, { mode: 0o700 });
+    const binding = createBundledRuntimeBinding(
+      resolveRuntimeBundle({ sheltieExecutable: join(createBundle(root, "binding"), "sheltie") }),
+      stateRoot,
+      "run-herdr-identity",
+    );
+    runtimeHomes.push(binding.configHome);
+
+    expect(() =>
+      parseRuntimeBinding({
+        ...binding,
+        herdr: { ...binding.herdr, version: "0.8.1" },
+      }),
+    ).toThrow(REQUIRED_V0_HERDR_VERSION);
+    expect(() =>
+      parseRuntimeBinding({
+        ...binding,
+        herdr: { ...binding.herdr, protocol: REQUIRED_V0_HERDR_PROTOCOL + 1 },
+      }),
+    ).toThrow(String(REQUIRED_V0_HERDR_PROTOCOL));
+  });
+
   test("rejects a tampered executable rather than using an ambient replacement", () => {
     const root = temporaryRoot("sheltie-runtime-digest-");
     const bundle = createBundle(root);
@@ -215,6 +263,28 @@ describe("runtime bundle resolution", () => {
     expect(() => resolveRuntimeBundle({ sheltieExecutable: join(safeBundle, "sheltie") })).toThrow("must not be a symbolic link");
   });
 
+  test("requires the current Sheltie executable to match the selected bundle artifact", () => {
+    const root = temporaryRoot("sheltie-runtime-sheltie-identity-");
+    const bundle = createBundle(root);
+    const matchingExecutable = join(root, "matching-sheltie");
+    const mismatchingExecutable = join(root, "mismatching-sheltie");
+    writeFileSync(matchingExecutable, readFileSync(join(bundle, "sheltie")), { mode: 0o755 });
+    writeFileSync(mismatchingExecutable, "#!/bin/sh\necho another sheltie\n", { mode: 0o755 });
+
+    expect(
+      resolveRuntimeBundle({
+        sheltieExecutable: matchingExecutable,
+        runtimeDir: bundle,
+      }).root,
+    ).toBe(bundle);
+    expect(() =>
+      resolveRuntimeBundle({
+        sheltieExecutable: mismatchingExecutable,
+        runtimeDir: bundle,
+      }),
+    ).toThrow("current Sheltie executable does not match the selected bundle artifact");
+  });
+
   test("creates deterministic short private binding paths and rejects unrecognized persisted fields", () => {
     const root = temporaryRoot("sheltie-runtime-binding-");
     const bundle = resolveRuntimeBundle({ sheltieExecutable: join(createBundle(root), "sheltie") });
@@ -223,7 +293,7 @@ describe("runtime bundle resolution", () => {
     const binding = createBundledRuntimeBinding(bundle, stateRoot, "run-alpha");
     runtimeHomes.push(binding.configHome);
     const runHash = requestHash({ stateRoot, bundleDigest: bundle.digest, runId: "run-alpha" }).slice(0, 24);
-    const runtimeRoot = join(tmpdir(), `sheltie-herdr-${process.geteuid!()}`);
+    const runtimeRoot = join(realpathSync(tmpdir()), `sheltie-herdr-${process.geteuid!()}`);
 
     expect(parseRuntimeBinding(binding)).toEqual(binding);
     expect(binding).toMatchObject({
@@ -254,6 +324,73 @@ describe("runtime bundle resolution", () => {
     expect(createBundledRuntimeBinding(bundle, stateRoot, "run-alpha")).toEqual(binding);
     expect(createBundledRuntimeBinding(bundle, stateRoot, "  run-alpha  ")).toEqual(binding);
     expect(() => parseRuntimeBinding({ ...binding, ambientHerdr: "/usr/bin/herdr" })).toThrow("exactly");
+  });
+
+  test("canonicalizes TMPDIR before persisting Herdr runtime paths", () => {
+    const root = temporaryRoot("t-");
+    const bundle = resolveRuntimeBundle({ sheltieExecutable: join(createBundle(root), "sheltie") });
+    const stateRoot = join(root, "s");
+    const canonicalTmpdir = join(root, "t");
+    const linkedTmpdir = join(root, "l");
+    mkdirSync(stateRoot, { mode: 0o700 });
+    mkdirSync(canonicalTmpdir, { mode: 0o700 });
+    symlinkSync(canonicalTmpdir, linkedTmpdir, "dir");
+
+    const previousTmpdir = process.env.TMPDIR;
+    try {
+      process.env.TMPDIR = linkedTmpdir;
+      const binding = createBundledRuntimeBinding(bundle, stateRoot, "r");
+      runtimeHomes.push(binding.configHome);
+
+      expect(binding.configHome.startsWith(join(canonicalTmpdir, `sheltie-herdr-${process.geteuid!()}`))).toBe(true);
+      expect(binding.configHome).not.toContain(linkedTmpdir);
+    } finally {
+      if (previousTmpdir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previousTmpdir;
+    }
+  });
+
+  test("accepts the sticky root-owned /tmp runtime root", () => {
+    const root = temporaryRoot("sheltie-runtime-sticky-tmpdir-");
+    const bundle = resolveRuntimeBundle({ sheltieExecutable: join(createBundle(root), "sheltie") });
+    const stateRoot = join(root, "state");
+    mkdirSync(stateRoot, { mode: 0o700 });
+
+    const previousTmpdir = process.env.TMPDIR;
+    try {
+      process.env.TMPDIR = "/tmp";
+      const binding = createBundledRuntimeBinding(bundle, stateRoot, "run-sticky-tmpdir");
+      runtimeHomes.push(binding.configHome);
+
+      expect(binding.configHome.startsWith(join("/tmp", `sheltie-herdr-${process.geteuid!()}`))).toBe(true);
+    } finally {
+      if (previousTmpdir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previousTmpdir;
+    }
+  });
+
+  test("rejects TMPDIR with a non-sticky writable ancestor", () => {
+    const root = temporaryRoot("sheltie-runtime-tmpdir-ancestor-");
+    const bundle = resolveRuntimeBundle({ sheltieExecutable: join(createBundle(root), "sheltie") });
+    const stateRoot = join(root, "state");
+    const unsafeAncestor = join(root, "unsafe-ancestor");
+    const temporaryTmpdir = join(unsafeAncestor, "tmpdir");
+    mkdirSync(stateRoot, { mode: 0o700 });
+    mkdirSync(unsafeAncestor, { mode: 0o700 });
+    directoryModes.push({ path: unsafeAncestor, mode: lstatSync(unsafeAncestor).mode & 0o7777 });
+    chmodSync(unsafeAncestor, 0o777);
+    mkdirSync(temporaryTmpdir, { mode: 0o700 });
+
+    const previousTmpdir = process.env.TMPDIR;
+    try {
+      process.env.TMPDIR = temporaryTmpdir;
+      expect(() => createBundledRuntimeBinding(bundle, stateRoot, "run-unsafe-tmpdir")).toThrow(
+        "temporary directory ancestor grants group or other write access without the sticky bit",
+      );
+    } finally {
+      if (previousTmpdir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previousTmpdir;
+    }
   });
 
   test("isolates same run and bundle bindings across private state roots", () => {
@@ -349,11 +486,22 @@ describe("runtime bundle resolution", () => {
     expect(() => parseRuntimeBinding({ mode: "external", socketPath: "/foreign.sock" })).toThrow("exactly");
   });
 
-  test("rejects non-executable bundle binaries instead of falling back to PATH", () => {
+  test("requires executable artifacts to be executable by the current effective identity", () => {
     const root = temporaryRoot("sheltie-runtime-executable-");
     const bundle = createBundle(root);
-    chmodSync(join(bundle, "herdr"), 0o644);
+    const herdr = join(bundle, "herdr");
+    const resolves = () => resolveRuntimeBundle({ sheltieExecutable: join(bundle, "sheltie") });
 
-    expect(() => resolveRuntimeBundle({ sheltieExecutable: join(bundle, "sheltie") })).toThrow("not executable");
+    chmodSync(herdr, 0o000);
+    expect(resolves).toThrow("not executable");
+
+    for (const mode of [0o401, 0o410] as const) {
+      chmodSync(herdr, mode);
+      if (process.geteuid!() === 0) expect(resolves).not.toThrow();
+      else expect(resolves).toThrow("not executable");
+    }
+
+    chmodSync(herdr, 0o500);
+    expect(resolves).not.toThrow();
   });
 });

@@ -12,6 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   LINUX_X64_RUNTIME_TARGET,
   REQUIRED_V0_HERDR_SOURCE_COMMIT,
@@ -299,8 +300,8 @@ function copyArtifact(sourcePath: string, destinationRoot: string, destinationNa
   return createHash("sha256").update(readFileSync(destinationPath)).digest("hex");
 }
 
-function projectRoot(): string {
-  return resolve(dirname(new URL(import.meta.url).pathname), "..");
+export function projectRootFromFileUrl(moduleUrl: string): string {
+  return resolve(dirname(fileURLToPath(moduleUrl)), "..");
 }
 
 function parseArguments(arguments_: readonly string[]): BuildRuntimeBundleInput {
@@ -337,7 +338,7 @@ export async function buildRuntimeBundle(
   if (process.platform !== "linux" || process.arch !== "x64") {
     buildFailure(`target ${LINUX_X64_RUNTIME_TARGET} requires Linux x64, got ${process.platform}-${process.arch}`);
   }
-  const root = projectRoot();
+  const root = projectRootFromFileUrl(import.meta.url);
   const sheltiePath = assertInputArtifact(input.sheltiePath ?? join(root, "dist", "sheltie"), "dist/sheltie", true);
   const okfCompactionPath = assertInputArtifact(
     input.okfCompactionPath ?? join(root, "dist", "sheltie-okf-compaction.js"),

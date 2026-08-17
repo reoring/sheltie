@@ -21,6 +21,8 @@ export const RUNTIME_BUNDLE_API_VERSION = "sheltie.dev/runtime-bundle/v1alpha1";
 export const LINUX_X64_RUNTIME_TARGET = "linux-x64" as const;
 export const REQUIRED_V0_HERDR_SOURCE_COMMIT = "ea766d5a70d53ad66028d980fb43b5808947ea71";
 export const REQUIRED_V0_OMP_SOURCE_COMMIT = "90fd6477137fc38c5257f11ad13d9b031b39c526";
+export const REQUIRED_V0_HERDR_VERSION = "0.8.0";
+export const REQUIRED_V0_HERDR_PROTOCOL = 20;
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const SOURCE_COMMIT_PATTERN = /^[a-f0-9]{40,64}$/;
@@ -139,6 +141,11 @@ function effectiveUid(): number {
   return process.geteuid();
 }
 
+function effectiveGid(): number {
+  if (typeof process.getegid !== "function") fail("effective gid is unavailable");
+  return process.getegid();
+}
+
 function requireString(value: unknown, label: string): string {
   if (typeof value !== "string" || value.length === 0) fail(`${label} must be a non-empty string`);
   return value;
@@ -186,6 +193,18 @@ function requireProtocol(value: unknown, label: string): number {
     fail(`${label} must be a positive integer`);
   }
   return value;
+}
+
+function requireRequiredVersion(value: unknown, label: string, required: string): string {
+  const version = requireVersion(value, label);
+  if (version !== required) fail(`${label} must equal the required v0 Herdr version ${required}`);
+  return version;
+}
+
+function requireRequiredProtocol(value: unknown, label: string, required: number): number {
+  const protocol = requireProtocol(value, label);
+  if (protocol !== required) fail(`${label} must equal the required v0 Herdr protocol ${required}`);
+  return protocol;
 }
 
 function requireAbsolutePath(value: unknown, label: string): string {
@@ -239,6 +258,41 @@ function assertTrustedBundleAncestors(root: string): void {
   }
 }
 
+function assertTrustedTemporaryDirectory(root: string): void {
+  const uid = effectiveUid();
+  for (let directory = root; ; directory = dirname(directory)) {
+    const details = lstatIfPresent(directory);
+    const label = directory === root ? "temporary directory" : "temporary directory ancestor";
+    if (details === null) fail(`${label} is missing: ${directory}`);
+    if (details.isSymbolicLink()) fail(`${label} must not be a symbolic link: ${directory}`);
+    if (!details.isDirectory()) fail(`${label} must be a directory: ${directory}`);
+    if (details.uid !== uid && details.uid !== 0) {
+      fail(`${label} is not owned by the effective uid or root: ${directory}`);
+    }
+    if (
+      (details.mode & GROUP_OR_OTHER_WRITABLE_MODE_MASK) !== 0 &&
+      (details.mode & STICKY_DIRECTORY_MODE) === 0
+    ) {
+      fail(`${label} grants group or other write access without the sticky bit: ${directory}`);
+    }
+    if (directory === dirname(directory)) return;
+  }
+}
+
+function isExecutableByEffectiveIdentity(details: Stats): boolean {
+  const mode = details.mode;
+  const uid = effectiveUid();
+  if (uid === 0) return (mode & EXECUTABLE_MODE_MASK) !== 0;
+  if (details.uid === uid) return (mode & 0o100) !== 0;
+  if (
+    details.gid === effectiveGid() ||
+    (typeof process.getgroups === "function" && process.getgroups().includes(details.gid))
+  ) {
+    return (mode & 0o010) !== 0;
+  }
+  return (mode & 0o001) !== 0;
+}
+
 function assertTrustedArtifactDetails(details: Stats, path: string, executable: boolean): void {
   if (!details.isFile()) fail(`artifact must be a regular file: ${path}`);
   if (details.uid !== effectiveUid() && details.uid !== 0) {
@@ -247,7 +301,7 @@ function assertTrustedArtifactDetails(details: Stats, path: string, executable: 
   if ((details.mode & GROUP_OR_OTHER_WRITABLE_MODE_MASK) !== 0) {
     fail(`artifact grants group or other write access: ${path}`);
   }
-  if (executable && (details.mode & EXECUTABLE_MODE_MASK) === 0) {
+  if (executable && !isExecutableByEffectiveIdentity(details)) {
     fail(`runtime executable is not executable: ${path}`);
   }
 }
@@ -257,6 +311,7 @@ function readTrustedFile(path: string, label: string, executable = false): Buffe
   const initial = lstatIfPresent(path);
   if (initial === null) fail(`${label} is missing: ${path}`);
   if (initial.isSymbolicLink()) fail(`${label} must not be a symbolic link: ${path}`);
+  assertTrustedArtifactDetails(initial, path, executable);
 
   let descriptor: number;
   try {
@@ -271,6 +326,14 @@ function readTrustedFile(path: string, label: string, executable = false): Buffe
   } finally {
     closeSync(descriptor);
   }
+}
+
+function resolveTrustedCurrentSheltieExecutable(value: unknown): RuntimeArtifactIdentity {
+  const path = realpathSync(resolve(requireString(value, "sheltieExecutable")));
+  assertTrustedDirectory(dirname(path), "current Sheltie executable parent");
+  assertTrustedBundleAncestors(dirname(path));
+  const bytes = readTrustedFile(path, "current Sheltie executable", true);
+  return { path, sha256: createHash("sha256").update(bytes).digest("hex") };
 }
 
 function parseRelativeArtifact(
@@ -297,8 +360,16 @@ function parseHerdrArtifact(value: unknown): RuntimeBundleManifestHerdrArtifact 
       "artifacts.herdr.sourceCommit",
       REQUIRED_V0_HERDR_SOURCE_COMMIT,
     ),
-    version: requireVersion(artifact.version, "artifacts.herdr.version"),
-    protocol: requireProtocol(artifact.protocol, "artifacts.herdr.protocol"),
+    version: requireRequiredVersion(
+      artifact.version,
+      "artifacts.herdr.version",
+      REQUIRED_V0_HERDR_VERSION,
+    ),
+    protocol: requireRequiredProtocol(
+      artifact.protocol,
+      "artifacts.herdr.protocol",
+      REQUIRED_V0_HERDR_PROTOCOL,
+    ),
   };
 }
 
@@ -406,8 +477,8 @@ function requireBindingHerdr(value: unknown, expectedPath: string): HerdrRuntime
       "herdr.sourceCommit",
       REQUIRED_V0_HERDR_SOURCE_COMMIT,
     ),
-    version: requireVersion(artifact.version, "herdr.version"),
-    protocol: requireProtocol(artifact.protocol, "herdr.protocol"),
+    version: requireRequiredVersion(artifact.version, "herdr.version", REQUIRED_V0_HERDR_VERSION),
+    protocol: requireRequiredProtocol(artifact.protocol, "herdr.protocol", REQUIRED_V0_HERDR_PROTOCOL),
   };
 }
 
@@ -485,13 +556,16 @@ export function parseRuntimeBinding(value: unknown): RuntimeBinding {
 /** Resolves and validates the complete, non-relocatable identity of a v0 runtime bundle. */
 export function resolveRuntimeBundle(input: ResolveRuntimeBundleInput): RuntimeBundle {
   assertSupportedRuntimePlatform();
-  const sheltieExecutable = requireString(input.sheltieExecutable, "sheltieExecutable");
-  const root = realpathSync(resolve(input.runtimeDir ?? dirname(resolve(sheltieExecutable))));
+  const currentSheltie = resolveTrustedCurrentSheltieExecutable(input.sheltieExecutable);
+  const root = realpathSync(resolve(input.runtimeDir ?? dirname(currentSheltie.path)));
   assertTrustedDirectory(root, "runtime bundle root");
   assertTrustedBundleAncestors(root);
   const manifestBytes = readTrustedFile(join(root, "runtime-manifest.json"), "runtime manifest");
   const manifest = parseManifestBytes(manifestBytes);
   const sheltie = verifyArtifact(root, manifest.artifacts.sheltie, "Sheltie runtime", true);
+  if (currentSheltie.sha256 !== sheltie.sha256) {
+    fail("current Sheltie executable does not match the selected bundle artifact");
+  }
   const herdrArtifact = verifyArtifact(root, manifest.artifacts.herdr, "Herdr runtime", true);
   const ompArtifact = verifyArtifact(root, manifest.artifacts.omp, "OMP runtime", true);
   const okfCompaction = verifyArtifact(root, manifest.artifacts.okfCompaction, "OKF compaction extension", false);
@@ -578,7 +652,9 @@ export function createBundledRuntimeBinding(
   if (parsedRunId.length === 0 || parsedRunId.length > 128) fail("runId must contain 1-128 characters");
   const stateRoot = assertPrivateStateDirectory(resolve(requireString(statePath, "statePath")), "runtime state root");
   const runHash = requestHash({ stateRoot, bundleDigest: bundle.digest, runId: parsedRunId }).slice(0, RUNTIME_PATH_HASH_LENGTH);
-  const runtimeRoot = join(resolve(tmpdir()), `sheltie-herdr-${effectiveUid()}`);
+  const canonicalTmpdir = realpathSync(resolve(tmpdir()));
+  assertTrustedTemporaryDirectory(canonicalTmpdir);
+  const runtimeRoot = join(canonicalTmpdir, `sheltie-herdr-${effectiveUid()}`);
   const configHome = join(runtimeRoot, runHash);
   const sessionName = `s-${runHash.slice(0, SESSION_PATH_HASH_LENGTH)}`;
   const socketPath = join(configHome, "herdr", "sessions", sessionName, "herdr.sock");

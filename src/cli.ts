@@ -28,7 +28,7 @@ import {
 import { SheltieStore, type NodeRecord, type TreeRecord } from "./db.ts";
 import { getManifestRole, parseResolvedManifest, resolveManifestFile } from "./manifest.ts";
 import { ObservationReader, projectObservationLifecycle, type ObservationSnapshot } from "./observation.ts";
-import { RealRunController } from "./run.ts";
+import { RealRunController, type ExpectedRuntimeIdentity } from "./run.ts";
 import { assertPrivateStateDirectory, assertPrivateStateParentForDatabase, createPrivateStateDirectory } from "./state-security.ts";
 
 interface ParsedArguments {
@@ -227,7 +227,7 @@ export function runtimeExecutionOptions(binding: RuntimeBinding): RuntimeExecuti
 function runtimeControllerOptions(
   binding: RuntimeBinding,
   workspaceEnvironment: Record<string, string> | undefined,
-  onTreeReserved?: (tree: TreeRecord) => void,
+  onTreeReserved?: (tree: TreeRecord) => void | Promise<void>,
 ): ConstructorParameters<typeof RealRunController>[2] {
   return {
     ...runtimeExecutionOptions(binding),
@@ -687,6 +687,7 @@ async function runRealRun(arguments_: ParsedArguments, dependencies: RuntimeCliD
     let socketPath: string;
     let bundledRuntime: BundledRuntimeControl | null = null;
     let workspaceEnvironment: Record<string, string> | undefined;
+    let expectedRuntimeIdentity: ExpectedRuntimeIdentity | undefined;
     if (selection.mode === "external") {
       if (selection.socketPath === undefined) throw new Error("--runtime external requires --herdr-socket");
       runtimeBinding = dependencies.parseRuntimeBinding({ mode: "external" });
@@ -701,46 +702,32 @@ async function runRealRun(arguments_: ParsedArguments, dependencies: RuntimeCliD
       socketPath = binding.socketPath;
       bundledRuntime = dependencies.createBundledRuntime(binding);
       workspaceEnvironment = bundledWorkspaceEnvironment(binding, dependencies);
+      expectedRuntimeIdentity = { version: binding.herdr.version, protocol: binding.herdr.protocol };
     }
 
-    let treeReserved = false;
+    const store = new SheltieStore(databasePath);
     try {
-      if (bundledRuntime !== null) await bundledRuntime.ensureRunning();
-      const store = new SheltieStore(databasePath);
-      try {
-        const controller = new RealRunController(
-          store,
-          new HerdrClient(socketPath),
-          runtimeControllerOptions(runtimeBinding, workspaceEnvironment, () => {
-            treeReserved = true;
-            writeRunProgress("run_reserved", readRunSnapshot(statePath));
-          }),
-        );
-        await controller.startRun({
-          runId,
-          repoRoot: resolve(optionalFlag(arguments_, "repo") ?? process.cwd()),
-          base: optionalFlag(arguments_, "base") ?? "HEAD",
-          worktreeRoot: join(statePath, "worktrees"),
-          manifest,
-          herdrSocketPath: socketPath,
-          runtimeBinding,
-        });
-        await runUntilSettled(controller, arguments_, statePath);
-      } finally {
-        store.close();
-      }
-    } catch (error) {
-      if (!treeReserved && bundledRuntime !== null) {
-        try {
-          await bundledRuntime.stop();
-        } catch (stopError) {
-          throw new AggregateError(
-            [error, stopError],
-            "bundled runtime startup failed before tree reservation and owned session cleanup also failed",
-          );
-        }
-      }
-      throw error;
+      const controller = new RealRunController(
+        store,
+        new HerdrClient(socketPath),
+        runtimeControllerOptions(runtimeBinding, workspaceEnvironment, async () => {
+          writeRunProgress("run_reserved", readRunSnapshot(statePath));
+          if (bundledRuntime !== null) await bundledRuntime.ensureRunning();
+        }),
+      );
+      await controller.startRun({
+        runId,
+        repoRoot: resolve(optionalFlag(arguments_, "repo") ?? process.cwd()),
+        base: optionalFlag(arguments_, "base") ?? "HEAD",
+        worktreeRoot: join(statePath, "worktrees"),
+        manifest,
+        herdrSocketPath: socketPath,
+        runtimeBinding,
+        ...(expectedRuntimeIdentity === undefined ? {} : { expectedRuntimeIdentity }),
+      });
+      await runUntilSettled(controller, arguments_, statePath);
+    } finally {
+      store.close();
     }
     return;
   }

@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   buildRuntimeBundle,
+  projectRootFromFileUrl,
   type BuildRuntimeBundleInput,
   type RuntimeBuildInfoProbeProcess,
 } from "../scripts/build-runtime-bundle.ts";
@@ -94,6 +96,21 @@ function expectNoBundle(input: BuildRuntimeBundleInput): void {
 }
 
 describe("runtime bundle builder", () => {
+  test("decodes special-character file URLs to their checkout root", () => {
+    const root = mkdtempSync(join(tmpdir(), "sheltie build # % 日本語-"));
+    roots.push(root);
+    const modulePath = join(root, "scripts", "build-runtime-bundle.ts");
+    mkdirSync(dirname(modulePath), { recursive: true });
+    writeFileSync(modulePath, "");
+
+    const moduleUrl = pathToFileURL(modulePath).href;
+    expect(moduleUrl).toContain("%20");
+    expect(moduleUrl).toContain("%23");
+    expect(moduleUrl).toContain("%25");
+    expect(moduleUrl).toContain("%E6");
+    expect(projectRootFromFileUrl(moduleUrl)).toBe(root);
+  });
+
   test("records only matching artifact build-info source commits in the manifest", async () => {
     const input = createBuildInput();
 
