@@ -4,6 +4,26 @@ Sheltie coordinates a manifest-declared team of OMP Agents in Herdr workspaces, 
 
 > **Experimental local PoC.** Sheltie is for local, disposable research and development workflows. It is not production-ready, is not a hosted service, and must not be used as a hard security boundary.
 
+## Demo
+
+This recording shows a real recursive run inside Herdr: a root coordinator OMP creates an isolated team workspace, then the team OMP creates researcher and reviewer OMP Agents in parallel tabs. Their durable inbox results converge into one committed team artifact that the root merges.
+
+```text
+coordinator workspace
+└─ team workspace
+   ├─ researcher tab
+   └─ reviewer tab
+```
+
+[![Watch recursive OMP Agents grow inside Herdr](https://asciinema.org/a/1263287.svg)](https://asciinema.org/a/1263287)
+
+The audited cast is also committed for local playback:
+
+```bash
+asciinema play demo/sheltie.cast
+```
+
+
 ## Why Sheltie exists
 
 Sheltie started with a simple question: can one root coding Agent recursively form a team, delegate work to child Agents, and leave behind one reviewable Git result? The desired shape was fractal-style: a root could create an isolated team, that team could create local researchers or reviewers, and the system could durably report progress, finish nodes, merge isolated branches, and recover without a human reconstructing the run from terminal scrollback.
@@ -44,18 +64,6 @@ The resulting protocol is intentionally conservative: reserve before mutating, r
 - Authenticates every Agent-facing state mutation against the live Herdr Agent identity before opening the writable state store.
 - Projects a product-safe `ObservationSnapshot` and includes an optional read-only Herdr Cockpit.
 - Requires an explicit, exact-target cleanup plan before removing run-owned runtime resources.
-
-## Demo
-
-This recording is a real bundled run: one coordinator starts researcher and reviewer OMP Agents in parallel tabs, receives both durable inbox results, completes the three-node tree, quiesces the Agents, and applies digest-bound cleanup.
-
-[![Watch the Sheltie live demo](https://asciinema.org/a/DIAhNi9DD1vaC1v9.svg)](https://asciinema.org/a/DIAhNi9DD1vaC1v9)
-
-The audited cast is also committed for local playback:
-
-```bash
-asciinema play demo/sheltie.cast
-```
 
 ## Architecture
 

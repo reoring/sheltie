@@ -132,7 +132,7 @@ export class RealRunController {
     const rootRole = getManifestRole(manifest, tree.rootRole);
     if (this.store.findRootNode(tree.treeId) === null) {
       const branch = rootBranch(tree.runId);
-      await this.ensureRootBranch(tree, branch);
+      await this.ensureRootBranch(tree, branch, manifest.spec.root.name);
       this.store.reserveNode({
         nodeId: nodeIdForRequest(tree.treeId, "root"),
         treeId: tree.treeId,
@@ -208,7 +208,7 @@ export class RealRunController {
     };
   }
 
-  private async ensureRootBranch(tree: TreeRecord, branch: string): Promise<void> {
+  private async ensureRootBranch(tree: TreeRecord, branch: string, rootName: string): Promise<void> {
     const currentBranch = await runGit(tree.repoRoot, ["branch", "--show-current"]);
     if (currentBranch === branch) return;
     let branchHead: string | null = null;
@@ -223,7 +223,7 @@ export class RealRunController {
     if (tree.status !== "initializing") {
       throw new Error(`root source checkout is on ${currentBranch || "detached HEAD"}, expected ${branch}`);
     }
-    const label = rootWorkspaceLabel(nodeIdForRequest(tree.treeId, "root"));
+    const label = rootWorkspaceLabel(rootName, nodeIdForRequest(tree.treeId, "root"));
     const rootWorkspaces = (await this.herdr.snapshot()).workspaces.filter(
       (workspace) =>
         workspace.worktree?.checkout_path === tree.repoRoot &&

@@ -314,7 +314,9 @@ describe("RealRunController", () => {
     expect(fake.prompts[0]).toContain('--caller-pane \"$HERDR_PANE_ID\"');
     expect(fake.prompts[0]).not.toContain("--child-spawn-policy");
     expect(fake.prompts[0]).not.toContain("--placement workspace");
-    expect(fake.snapshotValue.workspaces.map((workspace) => workspace.label)).toEqual([running.nodes[0]!.nodeId]);
+    expect(fake.snapshotValue.workspaces.map((workspace) => workspace.label)).toEqual([
+      `${running.nodes[0]!.name} · ${running.nodes[0]!.nodeId}`,
+    ]);
     expect(fake.snapshotValue.tabs.map((tab) => tab.label)).toEqual(["coord"]);
     store.close();
     writeFileSync(join(root, "sheltie.yaml"), "source manifest changed after start\n");

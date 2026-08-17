@@ -416,7 +416,7 @@ describe("workspace environment propagation", () => {
     const rootRequest = {
       cwd: "/tmp/repo",
       focus: false,
-      label: rootNode.nodeId,
+      label: `${rootNode.name} · ${rootNode.nodeId}`,
       env: {
         PATH: "/runtime/bundle",
         SHELTIE_RUN_ID: "run-root-workspace",
@@ -472,7 +472,7 @@ describe("workspace environment propagation", () => {
       workspace_id: "w-root-1",
       cwd: rootNode.worktreePath,
       focus: false,
-      label: `${tabNode.name}-${tabNode.nodeId.slice(-8)}`,
+      label: `${tabNode.name} · ${tabNode.nodeId}`,
       env: {
         PATH: "/runtime/bundle",
         SHELTIE_RUN_ID: "run-root-workspace",
@@ -497,7 +497,7 @@ describe("workspace environment propagation", () => {
     const herdrRequest = {
       cwd: "/tmp/repo",
       focus: false,
-      label: node.nodeId,
+      label: `${node.name} · ${node.nodeId}`,
       env: {
         PATH: "/bundle:/usr/bin",
         SHELTIE_RUN_ID: "run-root-workspace",
@@ -519,7 +519,7 @@ describe("workspace environment propagation", () => {
 
 
 describe("root workspace identity", () => {
-  test("rebinds one response-lost root workspace by its deterministic node label", async () => {
+  test("rebinds one response-lost root workspace by its durable readable label", async () => {
     const { store, root } = seedRootWorkspaceStore();
     const node = store.getNode("node-root-workspace");
     const herdr = new FakeHerdr();
@@ -544,7 +544,7 @@ describe("root workspace identity", () => {
 
     await expect(first.provisionNode(node.nodeId)).rejects.toThrow("workspace response lost");
     expect(herdr.workspaceCreates).toEqual([
-      expect.objectContaining({ cwd: "/tmp/repo", label: node.nodeId }),
+      expect.objectContaining({ cwd: "/tmp/repo", label: `${node.name} · ${node.nodeId}` }),
     ]);
     expect(store.getNode(node.nodeId).workspaceId).toBeNull();
 

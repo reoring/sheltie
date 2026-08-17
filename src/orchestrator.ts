@@ -124,11 +124,11 @@ function sessionValue(agent: AgentInfo): string | null {
 }
 
 function tabLabelForNode(node: NodeRecord): string {
-  return `${node.name}-${node.nodeId.slice(-8)}`;
+  return `${node.name} · ${node.nodeId}`;
 }
 
-export function rootWorkspaceLabel(nodeId: string): string {
-  return nodeId;
+export function rootWorkspaceLabel(rootName: string, nodeId: string): string {
+  return `${rootName} · ${nodeId}`;
 }
 
 function allowsSpawn(policy: NodeSpawnPolicy, placement: NodePlacement): boolean {
@@ -377,7 +377,7 @@ export class SheltieOrchestrator {
     const request = {
       cwd: tree.repoRoot,
       focus: false,
-      label: rootWorkspaceLabel(node.nodeId),
+      label: rootWorkspaceLabel(node.name, node.nodeId),
       env: {
         ...this.options.workspaceEnvironment,
         SHELTIE_RUN_ID: tree.runId,
@@ -599,7 +599,7 @@ export class SheltieOrchestrator {
     const snapshot = await this.herdr.snapshot();
     const matches = snapshot.workspaces.filter(
       (workspace) =>
-        workspace.label === rootWorkspaceLabel(node.nodeId) &&
+        workspace.label === rootWorkspaceLabel(node.name, node.nodeId) &&
         (tree.repoSourceWorkspaceId === null || workspace.workspace_id === tree.repoSourceWorkspaceId) &&
         workspace.worktree?.checkout_path === tree.repoRoot &&
         !workspace.worktree.is_linked_worktree,
