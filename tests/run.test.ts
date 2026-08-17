@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SheltieStore } from "../src/db.ts";
+import { SheltieStore, type TreeRecord } from "../src/db.ts";
 import { commitAll, initDisposableRepo, resolveCommit, runGit } from "../src/git.ts";
 import type {
   AgentInfo,
@@ -216,8 +216,15 @@ describe("RealRunController", () => {
     const fake = new FakeRunHerdr();
     const manifest = createManifest(root);
     const store = new SheltieStore(databasePath);
+    let reservedTree: TreeRecord | null = null;
     const first = new RealRunController(store, fake, {
       sheltieExecutable: "/opt/sheltie",
+      onTreeReserved: (tree) => {
+        reservedTree = tree;
+        expect(store.getManifest(manifest.digest)?.resolved).toEqual(manifest.manifest);
+        expect(tree.runtimeBinding).toEqual({ mode: "external" });
+        expect(fake.workspaceCreateCalls).toBe(0);
+      },
     });
 
     const tree = await first.startRun({
@@ -235,7 +242,12 @@ describe("RealRunController", () => {
       rootSpawnPolicy: "workspace",
       manifestDigest: manifest.digest,
       rootRole: "coordinator",
+      runtimeBinding: { mode: "external" },
       status: "active",
+    });
+    expect(reservedTree).toMatchObject({
+      treeId: tree.treeId,
+      runtimeBinding: { mode: "external" },
     });
     expect(store.findRootNode(tree.treeId)).toMatchObject({
       parentNodeId: null,

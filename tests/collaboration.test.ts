@@ -657,6 +657,30 @@ describe("space and tab collaboration", () => {
     store.close();
   });
 
+  test("starts no OMP extension when compaction is disabled by the manifest", async () => {
+    const { store, herdr, orchestrator } = await createFixture();
+    const reviewer = await orchestrator.reserveChild({
+      parentPaneId: "w-root:p1",
+      requestKey: "compaction-disabled-reviewer",
+      name: "reviewer",
+      roleName: "reviewer",
+    });
+    const provisioned = await orchestrator.provisionNode(reviewer.nodeId);
+    if (provisioned.paneId === null) throw new Error("reviewer was not bound to a pane");
+
+    expect(herdr.agentStarts).toEqual([
+      {
+        name: agentNameForNode(reviewer.nodeId),
+        kind: "omp",
+        pane_id: provisioned.paneId,
+        args: [],
+        timeout_ms: 60_000,
+      },
+    ]);
+
+    store.close();
+  });
+
   test("rejects an unsafe OKF compaction extension before launching the selected agent", async () => {
     const { store, herdr, orchestrator } = await createFixture({
       createManifest: createCompactionPolicyManifest,

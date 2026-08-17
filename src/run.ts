@@ -11,6 +11,7 @@ import {
   spawnPolicyForRole,
 } from "./manifest.ts";
 import { rootWorkspaceLabel, type HerdrControl, SheltieOrchestrator } from "./orchestrator.ts";
+import type { RuntimeBinding } from "./runtime-bundle.ts";
 
 const REQUIRED_HERDR_VERSION = "0.8.0";
 const REQUIRED_HERDR_PROTOCOL = 20;
@@ -19,6 +20,8 @@ export type RunHerdrControl = HerdrControl;
 
 export interface RealRunControllerOptions {
   sheltieExecutable: string;
+  okfCompactionExtensionPath?: string;
+  workspaceEnvironment?: Record<string, string>;
   onTreeReserved?: (tree: TreeRecord) => void;
 }
 
@@ -29,6 +32,7 @@ export interface StartRunInput {
   worktreeRoot: string;
   manifest: ResolvedManifestDocument;
   herdrSocketPath: string;
+  runtimeBinding?: RuntimeBinding;
 }
 
 /**
@@ -88,20 +92,21 @@ export class RealRunController {
         resolved: input.manifest.manifest,
       },
       {
-      treeId: treeIdForRun(runId),
-      runId,
-      repoRoot,
-      repoSourceWorkspaceId: null,
-      herdrSocketPath: input.herdrSocketPath,
-      herdrVersion: pong.version,
-      herdrProtocol: pong.protocol,
-      baseCommit,
-      worktreeRoot: input.worktreeRoot,
-      rootTaskContract: rootRole.prompt.content,
-      rootSpawnPolicy: spawnPolicyForRole(input.manifest.manifest, rootRole),
-      manifestDigest: input.manifest.digest,
-      rootRole: rootRole.name,
-      status: "initializing",
+        treeId: treeIdForRun(runId),
+        runId,
+        repoRoot,
+        repoSourceWorkspaceId: null,
+        herdrSocketPath: input.herdrSocketPath,
+        herdrVersion: pong.version,
+        herdrProtocol: pong.protocol,
+        ...(input.runtimeBinding === undefined ? {} : { runtimeBinding: input.runtimeBinding }),
+        baseCommit,
+        worktreeRoot: input.worktreeRoot,
+        rootTaskContract: rootRole.prompt.content,
+        rootSpawnPolicy: spawnPolicyForRole(input.manifest.manifest, rootRole),
+        manifestDigest: input.manifest.digest,
+        rootRole: rootRole.name,
+        status: "initializing",
       },
     );
     this.options.onTreeReserved?.(tree);
@@ -153,7 +158,13 @@ export class RealRunController {
     if (tree.status === "completed" || tree.status === "failed" || tree.status === "cleaned") return this.status();
     const orchestrator = new SheltieOrchestrator(this.store, this.herdr, {
       sheltieExecutable: this.options.sheltieExecutable,
+      ...(this.options.okfCompactionExtensionPath === undefined
+        ? {}
+        : { okfCompactionExtensionPath: this.options.okfCompactionExtensionPath }),
       worktreeRoot: tree.worktreeRoot,
+      ...(this.options.workspaceEnvironment === undefined
+        ? {}
+        : { workspaceEnvironment: this.options.workspaceEnvironment }),
     });
     await this.reconcileUncertainRuntimeOperations(tree, orchestrator);
     await orchestrator.processPendingNodes(tree.treeId);

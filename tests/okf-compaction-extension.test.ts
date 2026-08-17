@@ -17,10 +17,11 @@ const roots: string[] = [];
 const RELEVANT_EVENTS = [
   "auto_compaction_start",
   "session.compacting",
-  "session_compact",
+  "session_compaction_precommit",
   "auto_compaction_end",
 ] as const;
 const REQUIRED_FLAGS = ["sheltie-okf-dir", "sheltie-okf-role"] as const;
+const INVALID_MARKER_REASON = "okf_marker_invalid";
 type RelevantEvent = (typeof RELEVANT_EVENTS)[number];
 type EventHandler = (event: unknown, context: unknown) => unknown;
 
@@ -106,21 +107,28 @@ function compactingEvent() {
   return { type: "session.compacting", sessionId: "session-test", messages: [] };
 }
 
-function compactedEvent(summary: string) {
+function compactionResult(summary: string) {
   return {
-    type: "session_compact",
-    fromExtension: false,
-    compactionEntry: {
-      type: "compaction",
-      id: "compaction-test",
-      parentId: "entry-before-compaction",
-      timestamp: "2026-08-15T00:00:00.000Z",
-      firstKeptEntryId: "entry-after-compaction",
-      tokensBefore: 8192,
-      summary,
-    },
+    type: "compaction",
+    id: "compaction-test",
+    parentId: "entry-before-compaction",
+    timestamp: "2026-08-15T00:00:00.000Z",
+    firstKeptEntryId: "entry-after-compaction",
+    tokensBefore: 8192,
+    summary,
   };
 }
+
+function precommitEvent(summary: string, timestamp = "2026-08-15T00:00:00.000Z") {
+  return {
+    type: "session_compaction_precommit",
+    reason: "threshold",
+    compaction: compactionResult(summary),
+    timestamp,
+    signal: new AbortController().signal,
+  };
+}
+
 
 function summaryWithMarker(content: string): string {
   return [
@@ -141,6 +149,25 @@ function markerInstruction(result: unknown): string {
     throw new Error("session.compacting marker context must be an array of strings");
   }
   return context.join("\n");
+}
+
+function isCancelled(result: unknown): result is { cancel: true; reason?: string } {
+  return (
+    result !== null &&
+    typeof result === "object" &&
+    "cancel" in result &&
+    result.cancel === true
+  );
+}
+
+async function emitPrecommitBeforeAppend(
+  api: FakeExtensionApi,
+  summary: string,
+  appendAndRebuild: () => void | Promise<void>,
+): Promise<unknown> {
+  const result = await api.emit("session_compaction_precommit", precommitEvent(summary));
+  if (!isCancelled(result)) await appendAndRebuild();
+  return result;
 }
 
 function conceptNames(outputDir: string): string[] {
@@ -165,6 +192,16 @@ function sourceResources(metadata: string): string[] {
     .map((resource) => resource.replace(/^['"]|['"]$/g, ""));
 }
 
+function currentProcessStartToken(): string {
+  const stat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
+  const commandEnd = stat.lastIndexOf(")");
+  const startToken = commandEnd === -1 ? undefined : stat.slice(commandEnd + 1).trim().split(/\s+/)[19];
+  if (startToken === undefined || !/^\d+$/.test(startToken)) {
+    throw new Error("test process start token is unavailable");
+  }
+  return startToken;
+}
+
 describe("OKF automatic-compaction extension", () => {
   test("registers only scoped flags and requests a bounded marker for automatic context-full compaction", async () => {
     const fixture = createFixture();
@@ -187,7 +224,7 @@ describe("OKF automatic-compaction extension", () => {
     expect(await api.emit("session.compacting", compactingEvent())).toBeUndefined();
   });
 
-  test("writes one idempotent portable draft OKF v0.2 concept from valid automatic marker content only", async () => {
+  test("persists valid automatic marker content before append and rebuild", async () => {
     const fixture = createFixture();
     const api = await loadExtension(fixture.outputDir);
     const markerContent = [
@@ -198,15 +235,20 @@ describe("OKF automatic-compaction extension", () => {
       "- Preserve the agreed ownership boundary for the next session.",
     ].join("\n");
     const summary = summaryWithMarker(markerContent);
+    const conceptName = `compaction-${createHash("sha256").update(markerContent, "utf8").digest("hex")}.md`;
+    let context = "context-before-append";
 
     await api.emit("auto_compaction_start", automaticStart());
     markerInstruction(await api.emit("session.compacting", compactingEvent()));
-    await api.emit("session_compact", compactedEvent(summary));
+    const result = await emitPrecommitBeforeAppend(api, summary, () => {
+      expect(context).toBe("context-before-append");
+      expect(conceptNames(fixture.outputDir)).toEqual([conceptName]);
+      expect(existsSync(join(fixture.outputDir, "index.md"))).toBe(true);
+      context = "context-after-rebuild";
+    });
 
-    const names = conceptNames(fixture.outputDir);
-    expect(names).toHaveLength(1);
-    const conceptName = names[0]!;
-    expect(conceptName).toMatch(/^compaction-[a-f0-9]{64}\.md$/);
+    expect(result).toBeUndefined();
+    expect(context).toBe("context-after-rebuild");
 
     const index = readFileSync(join(fixture.outputDir, "index.md"), "utf8");
     expect(index).toMatch(/^---\nokf_version:\s*["']?0\.2["']?\n---/);
@@ -242,27 +284,56 @@ describe("OKF automatic-compaction extension", () => {
     expect(concept).not.toContain("[[");
 
     const firstConcept = readFileSync(conceptPath, "utf8");
-    await api.emit("session_compact", compactedEvent(summary));
+    await api.emit("session_compaction_precommit", precommitEvent(summary, "2026-08-15T01:00:00.000Z"));
     expect(conceptNames(fixture.outputDir)).toEqual([conceptName]);
     expect(readFileSync(conceptPath, "utf8")).toBe(firstConcept);
 
     await api.emit("auto_compaction_end", automaticEnd());
-    await api.emit("session_compact", compactedEvent(summaryWithMarker("# Ignored after automatic end")));
+    expect(
+      await api.emit(
+        "session_compaction_precommit",
+        precommitEvent(summaryWithMarker("# Ignored after automatic end")),
+      ),
+    ).toBeUndefined();
     expect(conceptNames(fixture.outputDir)).toEqual([conceptName]);
   });
+
+
+  test("treats a missing precommit marker as a successful no-op", async () => {
+    const fixture = createFixture();
+    const api = await loadExtension(fixture.outputDir);
+    let context = "context-before-append";
+
+    await api.emit("auto_compaction_start", automaticStart());
+    markerInstruction(await api.emit("session.compacting", compactingEvent()));
+    const result = await emitPrecommitBeforeAppend(api, "# No durable marker this time", () => {
+      context = "context-after-rebuild";
+    });
+
+    expect(result).toBeUndefined();
+    expect(context).toBe("context-after-rebuild");
+    expect(conceptNames(fixture.outputDir)).toEqual([]);
+    expect(existsSync(join(fixture.outputDir, "index.md"))).toBe(false);
+  });
+
 
   test("does not emit an OKF bundle for manual compaction", async () => {
     const fixture = createFixture();
     const api = await loadExtension(fixture.outputDir);
 
     expect(await api.emit("session.compacting", compactingEvent())).toBeUndefined();
-    await api.emit("session_compact", compactedEvent(summaryWithMarker("# Manual compaction must not emit")));
+    expect(
+      await api.emit(
+        "session_compaction_precommit",
+        precommitEvent(summaryWithMarker("# Manual compaction must not emit")),
+      ),
+    ).toBeUndefined();
 
     expect(conceptNames(fixture.outputDir)).toEqual([]);
     expect(existsSync(join(fixture.outputDir, "index.md"))).toBe(false);
   });
 
-  test("fails closed for credential, path, runtime-ID, JWT, and opaque marker content without a partial concept", async () => {
+  test("cancels unsafe marker content before append without a partial concept", async () => {
     const unsafeMarkerContents = [
       "# Unsafe credential\n\napi_key=sk-test-not-a-real-secret",
       "# Unsafe absolute path\n\nfile:///private-state/runtime/okf-compaction/node-0123456789abcdef.yml",
@@ -280,11 +351,16 @@ describe("OKF automatic-compaction extension", () => {
     for (const content of unsafeMarkerContents) {
       const fixture = createFixture();
       const api = await loadExtension(fixture.outputDir);
+      let context = "context-before-append";
       await api.emit("auto_compaction_start", automaticStart());
       markerInstruction(await api.emit("session.compacting", compactingEvent()));
-      await api.emit("session_compact", compactedEvent(summaryWithMarker(content)));
+      const result = await emitPrecommitBeforeAppend(api, summaryWithMarker(content), () => {
+        context = "context-after-rebuild";
+      });
       await api.emit("auto_compaction_end", automaticEnd());
 
+      expect(result).toEqual({ cancel: true, reason: INVALID_MARKER_REASON });
+      expect(context).toBe("context-before-append");
       expect(conceptNames(fixture.outputDir)).toEqual([]);
       expect(existsSync(join(fixture.outputDir, "index.md"))).toBe(false);
     }
@@ -299,9 +375,13 @@ describe("OKF automatic-compaction extension", () => {
     ];
 
     await api.emit("auto_compaction_start", automaticStart());
-    await Promise.all(
-      contents.map((content) => api.emit("session_compact", compactedEvent(summaryWithMarker(content)))),
-    );
+    expect(
+      await Promise.all(
+        contents.map((content) =>
+          api.emit("session_compaction_precommit", precommitEvent(summaryWithMarker(content))),
+        ),
+      ),
+    ).toEqual([undefined, undefined]);
 
     const expectedNames = contents
       .map((content) => `compaction-${createHash("sha256").update(content, "utf8").digest("hex")}.md`)
@@ -319,24 +399,84 @@ describe("OKF automatic-compaction extension", () => {
     expect(existsSync(join(fixture.outputDir, ".okf-compaction.lock"))).toBe(false);
 
     await Promise.all(
-      contents.map((content) => api.emit("session_compact", compactedEvent(summaryWithMarker(content)))),
+      contents.map((content) =>
+        api.emit("session_compaction_precommit", precommitEvent(summaryWithMarker(content))),
+      ),
     );
     expect(readFileSync(join(fixture.outputDir, "index.md"), "utf8")).toBe(staticIndex);
   });
 
-  test("does not accept a same-hash concept whose existing bytes conflict", async () => {
+  test("reclaims a demonstrably stale crash lock before persisting", async () => {
+    const fixture = createFixture();
+    mkdirSync(fixture.outputDir, { recursive: true, mode: 0o700 });
+    const lockPath = join(fixture.outputDir, ".okf-compaction.lock");
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({
+        pid: 2_147_483_647,
+        processStartToken: "1",
+        ownerToken: "00000000-0000-4000-8000-000000000001",
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const api = await loadExtension(fixture.outputDir);
+    const content = "# Recovered after crash\n\nThe stale lock owner is demonstrably gone.";
+
+    await api.emit("auto_compaction_start", automaticStart());
+    await expect(
+      api.emit("session_compaction_precommit", precommitEvent(summaryWithMarker(content))),
+    ).resolves.toBeUndefined();
+
+    expect(conceptNames(fixture.outputDir)).toEqual([
+      `compaction-${createHash("sha256").update(content, "utf8").digest("hex")}.md`,
+    ]);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("preserves a live owner-token lock and refuses concurrent persistence", async () => {
+    const fixture = createFixture();
+    mkdirSync(fixture.outputDir, { recursive: true, mode: 0o700 });
+    const lockPath = join(fixture.outputDir, ".okf-compaction.lock");
+    const lockContents = `${JSON.stringify({
+      pid: process.pid,
+      processStartToken: currentProcessStartToken(),
+      ownerToken: "00000000-0000-4000-8000-000000000002",
+    })}\n`;
+    writeFileSync(lockPath, lockContents, { mode: 0o600 });
+    const api = await loadExtension(fixture.outputDir);
+
+    await api.emit("auto_compaction_start", automaticStart());
+    await expect(
+      api.emit(
+        "session_compaction_precommit",
+        precommitEvent(summaryWithMarker("# Must wait\n\nThe live owner retains the lock.")),
+      ),
+    ).rejects.toThrow("okf_persistence_failed");
+
+    expect(readFileSync(lockPath, "utf8")).toBe(lockContents);
+    expect(conceptNames(fixture.outputDir)).toEqual([]);
+  });
+
+  test("rejects before append when a same-hash concept conflicts", async () => {
     const fixture = createFixture();
     const api = await loadExtension(fixture.outputDir);
     const content = "# Canonical content";
     const digest = createHash("sha256").update(content, "utf8").digest("hex");
     const conceptPath = join(fixture.outputDir, "concepts", `compaction-${digest}.md`);
+    let context = "context-before-append";
 
     mkdirSync(join(fixture.outputDir, "concepts"), { recursive: true, mode: 0o700 });
     writeFileSync(conceptPath, "conflicting concept bytes", { encoding: "utf8", mode: 0o600 });
 
     await api.emit("auto_compaction_start", automaticStart());
-    await api.emit("session_compact", compactedEvent(summaryWithMarker(content)));
+    markerInstruction(await api.emit("session.compacting", compactingEvent()));
+    await expect(
+      emitPrecommitBeforeAppend(api, summaryWithMarker(content), () => {
+        context = "context-after-rebuild";
+      }),
+    ).rejects.toThrow();
 
+    expect(context).toBe("context-before-append");
     expect(readFileSync(conceptPath, "utf8")).toBe("conflicting concept bytes");
     expect(existsSync(join(fixture.outputDir, "index.md"))).toBe(false);
   });

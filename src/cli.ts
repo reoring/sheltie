@@ -11,12 +11,21 @@ import {
 import { CleanupController, type CleanupPlan } from "./cleanup.ts";
 import { CancellationController } from "./cancel.ts";
 import { commitExistsOnBranch, isCleanWorktree } from "./git.ts";
+import { BundledHerdrRuntime, controlledHerdrEnvironment, type BundledHerdrRuntimeStatus } from "./herdr-runtime.ts";
 import { HerdrClient } from "./herdr-client.ts";
 import { createId } from "./ids.ts";
 import { MergeController } from "./merge.ts";
 import { SheltieOrchestrator } from "./orchestrator.ts";
 import { QuiesceController } from "./quiesce.ts";
-import { SheltieStore, type NodeRecord } from "./db.ts";
+import {
+  assertRuntimeBundleMatchesBinding,
+  createBundledRuntimeBinding,
+  parseRuntimeBinding,
+  resolveRuntimeBundle,
+  type BundledRuntimeBinding,
+  type RuntimeBinding,
+} from "./runtime-bundle.ts";
+import { SheltieStore, type NodeRecord, type TreeRecord } from "./db.ts";
 import { getManifestRole, parseResolvedManifest, resolveManifestFile } from "./manifest.ts";
 import { ObservationReader, projectObservationLifecycle, type ObservationSnapshot } from "./observation.ts";
 import { RealRunController } from "./run.ts";
@@ -63,6 +72,190 @@ function requiredFlag(arguments_: ParsedArguments, name: string): string {
 function optionalFlag(arguments_: ParsedArguments, name: string): string | undefined {
   const value = arguments_.flags.get(name);
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+export interface RuntimeStartSelection {
+  mode: "bundled" | "external";
+  socketPath?: string;
+  runtimeDir?: string;
+}
+
+export interface BundledRuntimeControl {
+  ensureRunning(): Promise<unknown>;
+  status(): Promise<BundledHerdrRuntimeStatus>;
+  stop(): Promise<BundledHerdrRuntimeStatus>;
+  attach(): unknown | Promise<unknown>;
+}
+
+export interface RuntimeCliDependencies {
+  parseRuntimeBinding: typeof parseRuntimeBinding;
+  resolveRuntimeBundle: typeof resolveRuntimeBundle;
+  createBundledRuntimeBinding: typeof createBundledRuntimeBinding;
+  assertRuntimeBundleMatchesBinding: typeof assertRuntimeBundleMatchesBinding;
+  controlledHerdrEnvironment: typeof controlledHerdrEnvironment;
+  createBundledRuntime: (binding: BundledRuntimeBinding) => BundledRuntimeControl;
+}
+
+const DEFAULT_RUNTIME_CLI_DEPENDENCIES: RuntimeCliDependencies = {
+  parseRuntimeBinding,
+  resolveRuntimeBundle,
+  createBundledRuntimeBinding,
+  assertRuntimeBundleMatchesBinding,
+  controlledHerdrEnvironment,
+  createBundledRuntime: (binding) => new BundledHerdrRuntime(binding),
+};
+
+function runtimeCliDependencies(overrides: Partial<RuntimeCliDependencies> = {}): RuntimeCliDependencies {
+  return { ...DEFAULT_RUNTIME_CLI_DEPENDENCIES, ...overrides };
+}
+
+function stringFlagWhenPresent(arguments_: ParsedArguments, name: string): string | undefined {
+  if (!arguments_.flags.has(name)) return undefined;
+  const value = optionalFlag(arguments_, name);
+  if (value === undefined) throw new Error(`--${name} requires a non-empty value`);
+  return value;
+}
+
+function runtimeStartSelection(arguments_: ParsedArguments): RuntimeStartSelection {
+  const requestedMode = stringFlagWhenPresent(arguments_, "runtime");
+  if (requestedMode !== undefined && requestedMode !== "bundled" && requestedMode !== "external") {
+    throw new Error("--runtime must be bundled or external");
+  }
+  const socketPath = stringFlagWhenPresent(arguments_, "herdr-socket");
+  const runtimeDir = stringFlagWhenPresent(arguments_, "runtime-dir");
+  const mode = requestedMode ?? (socketPath === undefined ? "bundled" : "external");
+  if (mode === "bundled" && socketPath !== undefined) {
+    throw new Error("--runtime bundled cannot be combined with --herdr-socket");
+  }
+  if (mode === "external" && socketPath === undefined) {
+    throw new Error("--runtime external requires --herdr-socket");
+  }
+  if (mode === "external" && runtimeDir !== undefined) {
+    throw new Error("--runtime-dir is valid only with bundled runtime mode");
+  }
+  if (mode === "external") return { mode, socketPath: socketPath! };
+  return runtimeDir === undefined ? { mode } : { mode, runtimeDir };
+}
+
+/** Parses runtime selection without resolving or starting any runtime. */
+export function resolveRuntimeStartSelection(argv: string[]): RuntimeStartSelection {
+  return runtimeStartSelection(parseArguments(argv));
+}
+
+function assertNoRuntimeStartFlags(arguments_: ParsedArguments): void {
+  for (const name of ["runtime", "runtime-dir", "herdr-socket"]) {
+    if (arguments_.flags.has(name)) {
+      throw new Error(`--${name} is valid only with run start`);
+    }
+  }
+}
+export function projectBundledWorkspaceEnvironment(environment: Record<string, string>): Record<string, string> {
+  const path = environment.PATH;
+  if (path === undefined || path.length === 0) throw new Error("bundled runtime produced an empty PATH");
+  return { PATH: path };
+}
+
+function bundledWorkspaceEnvironment(
+  binding: BundledRuntimeBinding,
+  dependencies: RuntimeCliDependencies,
+): Record<string, string> {
+  return projectBundledWorkspaceEnvironment(dependencies.controlledHerdrEnvironment(binding));
+}
+
+
+
+function bundledRuntimeForTree(
+  tree: TreeRecord,
+  dependencies: RuntimeCliDependencies,
+): BundledRuntimeControl | null {
+  const binding = tree.runtimeBinding;
+  if (binding.mode === "external") return null;
+  const currentBundle = dependencies.resolveRuntimeBundle({
+    sheltieExecutable: binding.sheltie.path,
+    runtimeDir: binding.bundleRoot,
+  });
+  dependencies.assertRuntimeBundleMatchesBinding(currentBundle, binding);
+  return dependencies.createBundledRuntime(binding);
+}
+
+function socketPathForTree(tree: TreeRecord): string {
+  if (tree.runtimeBinding.mode === "external") return tree.herdrSocketPath;
+  if (tree.herdrSocketPath !== tree.runtimeBinding.socketPath) {
+    throw new Error("tree Herdr socket does not match the authoritative bundled runtime binding");
+  }
+  return tree.runtimeBinding.socketPath;
+}
+
+interface RuntimeForTree {
+  client: HerdrClient;
+  bundled: BundledRuntimeControl | null;
+  workspaceEnvironment?: Record<string, string>;
+}
+
+async function runtimeForTree(
+  tree: TreeRecord,
+  dependencies: RuntimeCliDependencies,
+  ensureRunning: boolean,
+): Promise<RuntimeForTree> {
+  const bundled = bundledRuntimeForTree(tree, dependencies);
+  if (bundled === null) {
+    return { client: new HerdrClient(socketPathForTree(tree)), bundled: null };
+  }
+  if (ensureRunning) await bundled.ensureRunning();
+  const binding = tree.runtimeBinding;
+  if (binding.mode !== "bundled") throw new Error("bundled runtime binding was lost");
+  return {
+    client: new HerdrClient(socketPathForTree(tree)),
+    bundled,
+    workspaceEnvironment: bundledWorkspaceEnvironment(binding, dependencies),
+  };
+}
+
+export interface RuntimeExecutionOptions {
+  sheltieExecutable: string;
+  okfCompactionExtensionPath?: string;
+}
+
+export function runtimeExecutionOptions(binding: RuntimeBinding): RuntimeExecutionOptions {
+  if (binding.mode === "external") return { sheltieExecutable: process.execPath };
+  return {
+    sheltieExecutable: binding.sheltie.path,
+    okfCompactionExtensionPath: binding.okfCompaction.path,
+  };
+}
+
+function runtimeControllerOptions(
+  binding: RuntimeBinding,
+  workspaceEnvironment: Record<string, string> | undefined,
+  onTreeReserved?: (tree: TreeRecord) => void,
+): ConstructorParameters<typeof RealRunController>[2] {
+  return {
+    ...runtimeExecutionOptions(binding),
+    ...(workspaceEnvironment === undefined ? {} : { workspaceEnvironment }),
+    ...(onTreeReserved === undefined ? {} : { onTreeReserved }),
+  };
+}
+
+function projectRuntimeStatus(
+  binding: BundledRuntimeBinding,
+  status: BundledHerdrRuntimeStatus,
+): {
+  mode: "bundled";
+  ownership: "run";
+  state: BundledHerdrRuntimeStatus["state"];
+  target: BundledRuntimeBinding["bundleTarget"];
+  expectedHerdr: { version: string; protocol: number };
+  observedHerdr: { version: string; protocol: number } | null;
+} {
+  return {
+    mode: "bundled",
+    ownership: "run",
+    state: status.state,
+    target: binding.bundleTarget,
+    expectedHerdr: { version: binding.herdr.version, protocol: binding.herdr.protocol },
+    observedHerdr:
+      status.state === "stopped" ? null : { version: status.version, protocol: status.protocol },
+  };
 }
 
 
@@ -149,12 +342,15 @@ function usage(): string {
   sheltie manifest validate --file PATH
   sheltie manifest resolve --file PATH --json
   sheltie observe snapshot --state PATH [--unsafe-output]
-  sheltie run start --manifest PATH --repo PATH --herdr-socket PATH [--base REF] [--state PATH] [--once] [--unsafe-output]
+  sheltie run start --manifest PATH --repo PATH [--runtime bundled|external] [--runtime-dir PATH] [--herdr-socket PATH] [--base REF] [--state PATH] [--once] [--unsafe-output]
   sheltie run resume --state PATH [--once] [--unsafe-output]
   sheltie run cancel --state PATH [--grace-ms N] [--unsafe-output]
   sheltie run quiesce --state PATH [--grace-ms N] [--unsafe-output]
   sheltie run status --state PATH [--unsafe-output]
   sheltie run cleanup --state PATH [--apply --plan-digest SHA256] [--unsafe-output]
+  sheltie runtime status --state PATH [--unsafe-output]
+  sheltie runtime stop --state PATH [--unsafe-output]
+  sheltie runtime attach --state PATH [--unsafe-output]
   sheltie spawn --db PATH [--caller-pane ID] --request-key KEY --name NAME --role ROLE [--params-json JSON]
   sheltie step claim --db PATH --operation-id ID [--caller-pane ID]
   sheltie step complete --db PATH --operation-id ID --commit SHA [--caller-pane ID]
@@ -209,7 +405,7 @@ async function runSpawn(arguments_: ParsedArguments): Promise<void> {
   }
   await withAuthenticatedAgentStore(arguments_, async (store, caller) => {
     const orchestrator = new SheltieOrchestrator(store, new HerdrClient(caller.tree.herdrSocketPath), {
-      sheltieExecutable: process.execPath,
+      ...runtimeExecutionOptions(store.getTree(caller.tree.treeId).runtimeBinding),
       worktreeRoot: caller.tree.worktreeRoot,
     });
     printJson(
@@ -476,38 +672,81 @@ async function runUntilSettled(
   }
 }
 
-async function runRealRun(arguments_: ParsedArguments): Promise<void> {
+async function runRealRun(arguments_: ParsedArguments, dependencies: RuntimeCliDependencies): Promise<void> {
   const action = arguments_.positionals[1];
   if (action === "start") {
-    const runId = optionalFlag(arguments_, "run-id") ?? createId();
+    const selection = runtimeStartSelection(arguments_);
+    const runId = (optionalFlag(arguments_, "run-id") ?? createId()).trim();
+    if (runId.length === 0 || runId.length > 128) throw new Error("runId must contain 1-128 characters");
     const manifest = resolveManifestFile(resolve(requiredFlag(arguments_, "manifest")));
     const statePath = createPrivateStateDirectory(optionalFlag(arguments_, "state") ?? defaultStatePath(runId));
     const databasePath = databasePathForState(statePath);
     if (existsSync(databasePath)) throw new Error("run state already exists");
-    const socketPath = requiredFlag(arguments_, "herdr-socket");
-    const store = new SheltieStore(databasePath);
-    try {
-      const controller = new RealRunController(store, new HerdrClient(socketPath), {
+
+    let runtimeBinding: RuntimeBinding;
+    let socketPath: string;
+    let bundledRuntime: BundledRuntimeControl | null = null;
+    let workspaceEnvironment: Record<string, string> | undefined;
+    if (selection.mode === "external") {
+      if (selection.socketPath === undefined) throw new Error("--runtime external requires --herdr-socket");
+      runtimeBinding = dependencies.parseRuntimeBinding({ mode: "external" });
+      socketPath = selection.socketPath;
+    } else {
+      const bundle = dependencies.resolveRuntimeBundle({
         sheltieExecutable: process.execPath,
-        onTreeReserved: () => {
-          writeRunProgress("run_reserved", readRunSnapshot(statePath));
-        },
+        ...(selection.runtimeDir === undefined ? {} : { runtimeDir: resolve(selection.runtimeDir) }),
       });
-      await controller.startRun({
-        runId,
-        repoRoot: resolve(optionalFlag(arguments_, "repo") ?? process.cwd()),
-        base: optionalFlag(arguments_, "base") ?? "HEAD",
-        worktreeRoot: join(statePath, "worktrees"),
-        manifest,
-        herdrSocketPath: socketPath,
-      });
-      await runUntilSettled(controller, arguments_, statePath);
-    } finally {
-      store.close();
+      const binding = dependencies.createBundledRuntimeBinding(bundle, statePath, runId);
+      runtimeBinding = binding;
+      socketPath = binding.socketPath;
+      bundledRuntime = dependencies.createBundledRuntime(binding);
+      workspaceEnvironment = bundledWorkspaceEnvironment(binding, dependencies);
+    }
+
+    let treeReserved = false;
+    try {
+      if (bundledRuntime !== null) await bundledRuntime.ensureRunning();
+      const store = new SheltieStore(databasePath);
+      try {
+        const controller = new RealRunController(
+          store,
+          new HerdrClient(socketPath),
+          runtimeControllerOptions(runtimeBinding, workspaceEnvironment, () => {
+            treeReserved = true;
+            writeRunProgress("run_reserved", readRunSnapshot(statePath));
+          }),
+        );
+        await controller.startRun({
+          runId,
+          repoRoot: resolve(optionalFlag(arguments_, "repo") ?? process.cwd()),
+          base: optionalFlag(arguments_, "base") ?? "HEAD",
+          worktreeRoot: join(statePath, "worktrees"),
+          manifest,
+          herdrSocketPath: socketPath,
+          runtimeBinding,
+        });
+        await runUntilSettled(controller, arguments_, statePath);
+      } finally {
+        store.close();
+      }
+    } catch (error) {
+      if (!treeReserved && bundledRuntime !== null) {
+        try {
+          await bundledRuntime.stop();
+        } catch (stopError) {
+          throw new AggregateError(
+            [error, stopError],
+            "bundled runtime startup failed before tree reservation and owned session cleanup also failed",
+          );
+        }
+      }
+      throw error;
     }
     return;
   }
+
   if (action === "cleanup") {
+    assertNoRuntimeStartFlags(arguments_);
     const statePath = assertPrivateStateDirectory(requiredFlag(arguments_, "state"));
     // Reject an absent or legacy database before this mutable store could create or migrate it.
     readRunSnapshot(statePath);
@@ -515,11 +754,13 @@ async function runRealRun(arguments_: ParsedArguments): Promise<void> {
     const store = new SheltieStore(databasePath);
     try {
       const tree = store.getOnlyTree();
-      const controller = new CleanupController(store, new HerdrClient(tree.herdrSocketPath));
+      const runtime = await runtimeForTree(tree, dependencies, tree.status !== "cleaned");
+      const controller = new CleanupController(store, runtime.client);
       // Cleanup is an explicit operator-sensitive exact-target workflow.
       const unsafeOutput = arguments_.flags.has("unsafe-output");
       if (arguments_.flags.has("apply")) {
         const result = await controller.apply(optionalFlag(arguments_, "plan-digest"));
+        if (result.tree.status === "cleaned" && runtime.bundled !== null) await runtime.bundled.stop();
         printJson(cleanupApplyOutput(statePath, result, unsafeOutput));
       } else {
         if (arguments_.flags.has("plan-digest")) {
@@ -532,9 +773,11 @@ async function runRealRun(arguments_: ParsedArguments): Promise<void> {
     }
     return;
   }
+
   if (action !== "resume" && action !== "status" && action !== "cancel" && action !== "quiesce") {
     throw new Error("run action must be start, resume, status, cancel, quiesce, or cleanup");
   }
+  assertNoRuntimeStartFlags(arguments_);
   const statePath = assertPrivateStateDirectory(requiredFlag(arguments_, "state"));
   if (action === "status") {
     printJson(readRunSnapshot(statePath));
@@ -546,30 +789,29 @@ async function runRealRun(arguments_: ParsedArguments): Promise<void> {
   const store = new SheltieStore(databasePath);
   try {
     const tree = store.getOnlyTree();
+    const runtime = await runtimeForTree(
+      tree,
+      dependencies,
+      tree.status !== "cleaned",
+    );
     if (action === "quiesce") {
       const graceMs = boundedIntegerFlag(arguments_, "grace-ms", 5_000, 100, 30_000);
-      const result = await new QuiesceController(
-        store,
-        new HerdrClient(tree.herdrSocketPath),
-        { graceMs },
-      ).quiesceRun();
+      const result = await new QuiesceController(store, runtime.client, { graceMs }).quiesceRun();
       printRunControlResult("quiesce", readRunSnapshot(statePath), result.unresolvedOperations.length);
       if (result.unresolvedOperations.length > 0) process.exitCode = 1;
       return;
     }
-    const controller = new RealRunController(store, new HerdrClient(tree.herdrSocketPath), {
-      sheltieExecutable: process.execPath,
-    });
+    const controller = new RealRunController(
+      store,
+      runtime.client,
+      runtimeControllerOptions(tree.runtimeBinding, runtime.workspaceEnvironment),
+    );
     if (
       action === "cancel" ||
       (action === "resume" && ["cancel_requested", "cancelling", "cancel_blocked"].includes(tree.status))
     ) {
       const graceMs = boundedIntegerFlag(arguments_, "grace-ms", 5_000, 100, 30_000);
-      const cancellation = new CancellationController(
-        store,
-        new HerdrClient(tree.herdrSocketPath),
-        { graceMs },
-      );
+      const cancellation = new CancellationController(store, runtime.client, { graceMs });
       const status = await cancellation.cancelRun();
       const snapshot = readRunSnapshot(statePath);
       writeRunProgress("run_progress", snapshot);
@@ -583,7 +825,57 @@ async function runRealRun(arguments_: ParsedArguments): Promise<void> {
   }
 }
 
-async function runReconcile(arguments_: ParsedArguments): Promise<void> {
+async function runRuntime(arguments_: ParsedArguments, dependencies: RuntimeCliDependencies): Promise<void> {
+  const action = arguments_.positionals[1];
+  if (action !== "status" && action !== "stop" && action !== "attach") {
+    throw new Error("runtime action must be status, stop, or attach");
+  }
+  assertNoRuntimeStartFlags(arguments_);
+  const statePath = assertPrivateStateDirectory(requiredFlag(arguments_, "state"));
+  // Reject an absent or legacy database before opening the mutable store.
+  readRunSnapshot(statePath);
+  const store = new SheltieStore(databasePathForState(statePath));
+  try {
+    const tree = store.getOnlyTree();
+    const unsafeOutput = arguments_.flags.has("unsafe-output");
+    if (tree.runtimeBinding.mode === "external") {
+      if (action !== "status") {
+        throw new Error(`runtime ${action} is unavailable for an external Herdr socket`);
+      }
+      const pong = await new HerdrClient(socketPathForTree(tree)).ping();
+      const status = { state: "external" as const, version: pong.version, protocol: pong.protocol };
+      if (unsafeOutput) {
+        printJson({ statePath, binding: tree.runtimeBinding, socketPath: tree.herdrSocketPath, status });
+      } else {
+        printJson({
+          mode: "external",
+          ownership: "external",
+          state: status.state,
+          observedHerdr: { version: status.version, protocol: status.protocol },
+        });
+      }
+      return;
+    }
+
+    const binding = tree.runtimeBinding;
+    const bundled = bundledRuntimeForTree(tree, dependencies);
+    if (bundled === null) throw new Error("bundled runtime binding was lost");
+    if (action === "attach") {
+      await bundled.attach();
+      return;
+    }
+    const status = action === "stop" ? await bundled.stop() : await bundled.status();
+    if (unsafeOutput) {
+      printJson({ statePath, binding, status });
+    } else {
+      printJson(projectRuntimeStatus(binding, status));
+    }
+  } finally {
+    store.close();
+  }
+}
+
+async function runReconcile(arguments_: ParsedArguments, dependencies: RuntimeCliDependencies): Promise<void> {
   if (!arguments_.flags.has("unsafe-output")) {
     throw new Error("reconcile requires --unsafe-output because it emits operator-only runtime records");
   }
@@ -598,8 +890,10 @@ async function runReconcile(arguments_: ParsedArguments): Promise<void> {
   const store = new SheltieStore(databasePath);
   try {
     const tree = store.getTree(treeId);
-    const orchestrator = new SheltieOrchestrator(store, new HerdrClient(tree.herdrSocketPath), {
-      sheltieExecutable: process.execPath,
+    const runtime = await runtimeForTree(tree, dependencies, tree.status !== "cleaned");
+    const orchestrator = new SheltieOrchestrator(store, runtime.client, {
+      ...runtimeExecutionOptions(tree.runtimeBinding),
+      ...(runtime.workspaceEnvironment === undefined ? {} : { workspaceEnvironment: runtime.workspaceEnvironment }),
     });
     // Reconciliation output carries runtime locators, so it is never a normal lifecycle surface.
     const nodes = [];
@@ -610,20 +904,24 @@ async function runReconcile(arguments_: ParsedArguments): Promise<void> {
   }
 }
 
-
-export async function runCli(argv: string[]): Promise<void> {
+export async function runCli(
+  argv: string[],
+  dependencyOverrides: Partial<RuntimeCliDependencies> = {},
+): Promise<void> {
   const arguments_ = parseArguments(argv);
+  const dependencies = runtimeCliDependencies(dependencyOverrides);
   const command = arguments_.positionals[0];
   if (command === "manifest") runManifest(arguments_);
   else if (command === "observe") runObserve(arguments_);
-  else if (command === "run") await runRealRun(arguments_);
+  else if (command === "run") await runRealRun(arguments_, dependencies);
+  else if (command === "runtime") await runRuntime(arguments_, dependencies);
   else if (command === "spawn") await runSpawn(arguments_);
   else if (command === "step") await runStep(arguments_);
   else if (command === "node") await runNode(arguments_);
   else if (command === "sync") await runSync(arguments_);
   else if (command === "message") await runMessage(arguments_);
   else if (command === "merge") await runMerge(arguments_);
-  else if (command === "reconcile") await runReconcile(arguments_);
+  else if (command === "reconcile") await runReconcile(arguments_, dependencies);
   else {
     process.stderr.write(usage());
     process.exitCode = command === undefined || command === "help" ? 0 : 2;
@@ -635,7 +933,9 @@ export function formatExecutableError(argv: string[], error: unknown): string {
   const rawMessage = error instanceof Error ? error.message : String(error);
   if (arguments_.flags.has("unsafe-output")) return rawMessage;
   const command = arguments_.positionals[0];
-  return command === "run" || command === "observe" ? "sheltie command failed" : rawMessage;
+  return command === "run" || command === "runtime" || command === "observe"
+    ? "sheltie command failed"
+    : rawMessage;
 }
 
 if (import.meta.main) {

@@ -69,9 +69,8 @@ The runtime gate is intentionally exact. Sheltie supports the public [`reoring/h
 
 - Bun **1.3.13**.
 - Git and a clean, disposable source checkout. Starting a run creates or switches to a Sheltie root branch in that checkout.
-- A local Herdr runtime at the compatibility level above, with a reachable Unix socket. Supply its socket path to `--herdr-socket`.
-- An OMP Agent runtime that Herdr can start for manifest roles whose `agent.kind` is `omp`.
-- A Unix-like local environment. The optional Cockpit plugin currently declares Linux support.
+- For the default bundled mode, a Linux-x64 runtime bundle containing exact Sheltie, Herdr, OMP, and the OKF compaction extension. Bundled mode never falls back to ambient `herdr` or `omp`.
+- For explicit external mode, a compatible local Herdr runtime with a reachable Unix socket and an OMP runtime that it can start. Supply its socket path with `--herdr-socket`.
 
 [Devbox](https://www.jetify.com/devbox) is optional and provides the pinned development environment.
 
@@ -86,7 +85,18 @@ bun install
 bun run build
 ```
 
-The build writes the executable to `dist/sheltie` and the sibling bundled automatic-compaction extension to `dist/sheltie-okf-compaction.js`.
+`bun run build` writes `dist/sheltie` and its sibling automatic-compaction extension `dist/sheltie-okf-compaction.js`; it does not require runtime inputs. To create a distributable Linux-x64 runtime bundle after that normal build, provide the exact Herdr and OMP artifacts and their source commits:
+
+```bash
+bun scripts/build-runtime-bundle.ts \
+  --herdr-bin /path/to/herdr \
+  --herdr-commit <herdr-source-commit> \
+  --omp-bin /path/to/omp \
+  --omp-commit <omp-source-commit> \
+  --output ./sheltie-runtime
+```
+
+`bun run build:bundle -- --herdr-bin … --herdr-commit … --omp-bin … --omp-commit …` is the equivalent build-script entry point. The output is a flat bundle; see [Runtime bundles](docs/runtime-bundles.md) for its layout and lifecycle.
 
 ## Automatic compaction knowledge
 
@@ -100,11 +110,13 @@ knowledge:
     thresholdPercent: 70
 ```
 
-Selected roles receive an owner-private `context-full` overlay with `remoteEnabled: false`, the manifest threshold, `thresholdTokens: -1`, and `autoContinue: true`; OMP therefore uses local context-full summarization and honors `session.compacting` marker context. The configured automatic-compaction extension is staged as a private copy before OMP starts, and only that staged extension is passed to OMP.
+Selected roles receive an owner-private `context-full` overlay with `remoteEnabled: false`, the manifest threshold, `thresholdTokens: -1`, and `autoContinue: true`. The configured automatic-compaction extension is staged as a private copy before OMP starts, and only that staged extension is passed to OMP.
 
-While an automatic compaction is active, the staged extension asks for a bounded `<sheltie-okf>...</sheltie-okf>` marker and extracts only that marker. For each selected node it writes a private OKF v0.2 bundle: `index.md` and an idempotent `concepts/compaction-<digest>.md` concept with portable, non-file provenance. Concepts are private, unverified drafts rather than logical or run authority; SQLite remains authoritative, and the raw surrounding summary or raw transcript is never copied.
+For each normal automatic `context-full` summary commit, OMP first derives the proposed compaction entry and then awaits the staged extension's `session_compaction_precommit` listener before it appends the entry or replaces live session context. If the entry contains a valid bounded `<sheltie-okf>...</sheltie-okf>` marker, the listener writes one private OKF v0.2 handoff: `index.md` and the idempotent `concepts/compaction-<digest>.md` concept with portable, non-file provenance. The listener resolves only after that write completes. A write failure rejects the listener and aborts the compaction attempt; unsafe marker content cancels it without a partial artifact. A missing marker is a successful no-op. Sheltie has no post-compaction persistence fallback. OMP's separate handoff, shake/elide, image-drop, and dead-end recovery rewrites do not emit this event and therefore do not carry this atomic OKF guarantee.
 
-Pattern screening is bounded and best-effort, not exhaustive path, credential, runtime-ID, or secret detection. Empty or oversized markers, wikilinks, traversal/tilde/SSH path signals, credential-like patterns, JWTs, runtime IDs or UUIDs, and long token/hash-like values fail closed without partial output. Processes running as the same Unix user remain outside Sheltie's hard security boundary. Knowledge or extension write failures are logged without aborting compaction, so artifact emission may be skipped. Cleanup preserves these private knowledge bundles.
+These concepts are durable external knowledge, not live OMP context, logical or run authority, or a mechanism for immediate bounded parent context. They also do not replace the durable inbox or background-node delegation. SQLite remains authoritative, and neither the raw surrounding summary nor raw transcript is copied.
+
+Pattern screening is bounded and best-effort, not exhaustive path, credential, runtime-ID, or secret detection. Empty or oversized markers, wikilinks, traversal/tilde/SSH path signals, credential-like patterns, JWTs, runtime IDs or UUIDs, and long token/hash-like values fail closed without partial output. Processes running as the same Unix user remain outside Sheltie's hard security boundary. Cleanup preserves these private knowledge bundles.
 
 ## Quickstart: research team
 
@@ -128,10 +140,20 @@ First validate the manifest:
 ./dist/sheltie manifest validate --file examples/research-team/sheltie.yaml
 ```
 
-Then, from a **clean disposable Git checkout**, start the run with the socket path for your compatible local Herdr runtime:
+Then, from a **clean disposable Git checkout**, start the run in default bundled mode. Invoke the `sheltie` executable from the runtime bundle so it resolves its sibling Herdr, OMP, and extension artifacts:
+
+```bash
+./sheltie-runtime/sheltie run start \
+  --manifest examples/research-team/sheltie.yaml \
+  --repo . \
+  --state .sheltie-state
+```
+
+Existing Herdr sockets remain an explicit external mode:
 
 ```bash
 ./dist/sheltie run start \
+  --runtime external \
   --manifest examples/research-team/sheltie.yaml \
   --repo . \
   --herdr-socket "$HERDR_SOCKET" \
@@ -143,16 +165,17 @@ A missing `--state` directory is created with mode `0700`. An existing state dir
 Useful lifecycle reads are:
 
 ```bash
-./dist/sheltie run status --state .sheltie-state
-./dist/sheltie observe snapshot --state .sheltie-state
+./sheltie-runtime/sheltie run status --state .sheltie-state
+./sheltie-runtime/sheltie runtime status --state .sheltie-state
+./sheltie-runtime/sheltie observe snapshot --state .sheltie-state
 ```
 
 Cleanup is operator-sensitive. The default preview exposes only the exact plan digest and aggregate counts. Add `--unsafe-output` only when you are ready to inspect machine-local target paths and runtime identifiers, then apply the reviewed plan with that exact digest:
 
 ```bash
-./dist/sheltie run cleanup --state .sheltie-state
-./dist/sheltie run cleanup --state .sheltie-state --unsafe-output
-./dist/sheltie run cleanup --state .sheltie-state --apply --plan-digest <plan-digest>
+./sheltie-runtime/sheltie run cleanup --state .sheltie-state
+./sheltie-runtime/sheltie run cleanup --state .sheltie-state --unsafe-output
+./sheltie-runtime/sheltie run cleanup --state .sheltie-state --apply --plan-digest <plan-digest>
 ```
 
 ## Completion protocol in the example
@@ -177,6 +200,7 @@ The Cockpit invokes only `sheltie observe snapshot --state …`; it does not ope
 | --- | --- |
 | Manifest | `manifest validate`, `manifest resolve` |
 | Lifecycle | `run start`, `run resume`, `run status`, `run cancel`, `run quiesce`, `run cleanup` |
+| Runtime | `runtime status`, `runtime stop`, `runtime attach` |
 | Observation | `observe snapshot` |
 | Agent protocol | `spawn`, `step claim`, `step complete`, `node finish`, `sync`, `merge`, `message send` |
 
@@ -189,6 +213,7 @@ Agent-protocol commands authenticate the current caller through `HERDR_PANE_ID` 
 - This is a runtime authorization and correctness guard, **not** a sandbox against another process running as the same Unix user with access to the state database, filesystem, or Herdr socket.
 - Read-only tab roles must not modify files or create commits. General concurrent read-write tabs have no write lease and are not implemented.
 - Cleanup is exact-target and plan-digest bound. Inspect exact targets through an explicit unsafe preview before applying the digest; do not use cleanup as a broad workspace removal command.
+- Bundled mode owns only the persisted, named Herdr session for its run. It binds `agent.kind: omp` to the verified absolute OMP artifact through `HERDR_AGENT_OMP_PATH`, keeps the bundle first on `PATH` for subordinate commands, and stops the owned session only after a successful clean result. External sockets are never started or stopped by Sheltie.
 
 For private vulnerability reporting, see [SECURITY.md](SECURITY.md).
 
@@ -202,6 +227,7 @@ Current limitations:
 - The sender CLI does not yet expose a stable message identity for idempotent retries after uncertain delivery.
 - Standard A2A discovery and transport are not implemented.
 - The Cockpit is read-only and currently declares Linux support.
+- Bundled runtimes are Linux x64 only in this release. A bundle contains both Herdr and OMP; packaging Herdr alone is insufficient because Herdr launches literal `omp …` commands.
 
 Near-term work is expected to focus on stabilizing the manifest and observation contracts, improving delivery semantics, and designing an explicit write-lease model before concurrent read-write tab work is enabled.
 
@@ -209,6 +235,7 @@ Near-term work is expected to focus on stabilizing the manifest and observation 
 
 - [Portable research-team example](examples/research-team/)
 - [Durable inbox and completion protocol](docs/durable-inbox.md)
+- [Runtime bundles and ownership](docs/runtime-bundles.md)
 - [Observation Cockpit plugin](plugins/observation-cockpit/herdr-plugin.toml)
 - [Contributing guide](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)

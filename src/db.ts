@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
+import { parseRuntimeBinding, type RuntimeBinding } from "./runtime-bundle.ts";
 import { isRecord } from "./type-guards.ts";
 import { getManifestRole, parseResolvedManifest, relationFromNode } from "./manifest.ts";
-
 export type OperationKind =
   | "workspace_create"
   | "spawn"
@@ -65,6 +65,7 @@ export interface TreeRecord {
   herdrSocketPath: string;
   herdrVersion: string;
   herdrProtocol: number;
+  runtimeBinding: RuntimeBinding;
   baseCommit: string;
   worktreeRoot: string;
   rootTaskContract: string;
@@ -113,12 +114,13 @@ export interface ManifestRecord {
 
 export type CreateTreeInput = Omit<
   TreeRecord,
-  "status" | "generation" | "rootSpawnPolicy" | "manifestDigest" | "rootRole"
+  "status" | "generation" | "rootSpawnPolicy" | "manifestDigest" | "rootRole" | "runtimeBinding"
 > & {
   status?: TreeStatus;
   rootSpawnPolicy?: NodeSpawnPolicy;
   manifestDigest?: string | null;
   rootRole?: string | null;
+  runtimeBinding?: RuntimeBinding;
 };
 
 export interface OperationRecord {
@@ -194,6 +196,7 @@ CREATE TABLE IF NOT EXISTS trees (
   herdr_socket_path TEXT NOT NULL,
   herdr_version TEXT NOT NULL,
   herdr_protocol INTEGER NOT NULL,
+  runtime_binding_json TEXT NOT NULL DEFAULT '{"mode":"external"}',
   base_commit TEXT NOT NULL,
   worktree_root TEXT NOT NULL,
   root_task_contract TEXT NOT NULL,
@@ -315,6 +318,16 @@ function parseJson(value: string | null): unknown | null {
   return value === null ? null : (JSON.parse(value) as unknown);
 }
 
+type TreeRow = Omit<TreeRecord, "runtimeBinding"> & { runtimeBindingJson: string };
+
+function treeFromRow(row: TreeRow): TreeRecord {
+  const { runtimeBindingJson, ...record } = row;
+  return {
+    ...record,
+    runtimeBinding: parseRuntimeBinding(JSON.parse(runtimeBindingJson)),
+  };
+}
+
 function cleanupPlanManifestDigest(plan: unknown): string | null {
   if (!isRecord(plan) || !Object.hasOwn(plan, "manifestDigest")) {
     throw new Error("cleanup plan payload is missing manifest identity");
@@ -394,13 +407,14 @@ export class SheltieStore {
   }
 
   createTree(input: CreateTreeInput): TreeRecord {
+    const runtimeBinding = parseRuntimeBinding(input.runtimeBinding ?? { mode: "external" });
     const timestamp = now();
     this.database
       .query(`INSERT INTO trees (
         tree_id, run_id, repo_root, repo_source_workspace_id, herdr_socket_path,
-        herdr_version, herdr_protocol, base_commit, worktree_root, root_task_contract,
+        herdr_version, herdr_protocol, runtime_binding_json, base_commit, worktree_root, root_task_contract,
         root_spawn_policy, manifest_digest, root_role, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         input.treeId,
         input.runId,
@@ -409,6 +423,7 @@ export class SheltieStore {
         input.herdrSocketPath,
         input.herdrVersion,
         input.herdrProtocol,
+        JSON.stringify(runtimeBinding),
         input.baseCommit,
         input.worktreeRoot,
         input.rootTaskContract,
@@ -427,13 +442,13 @@ export class SheltieStore {
       .query(`SELECT tree_id AS treeId, run_id AS runId, repo_root AS repoRoot,
         repo_source_workspace_id AS repoSourceWorkspaceId, herdr_socket_path AS herdrSocketPath,
         herdr_version AS herdrVersion, herdr_protocol AS herdrProtocol,
-        base_commit AS baseCommit, worktree_root AS worktreeRoot,
+        runtime_binding_json AS runtimeBindingJson, base_commit AS baseCommit, worktree_root AS worktreeRoot,
         root_task_contract AS rootTaskContract, root_spawn_policy AS rootSpawnPolicy,
         manifest_digest AS manifestDigest, root_role AS rootRole,
         status, generation FROM trees WHERE tree_id = ?`)
-      .get(treeId) as TreeRecord | null;
+      .get(treeId) as TreeRow | null;
     if (row === null) throw new Error(`tree ${treeId} not found`);
-    return row;
+    return treeFromRow(row);
   }
 
   getOnlyTree(): TreeRecord {
@@ -1244,6 +1259,11 @@ export class SheltieStore {
     const treeColumns = this.database.query("PRAGMA table_info(trees)").all() as { name: string }[];
     if (!treeColumns.some((column) => column.name === "generation")) {
       this.database.exec("ALTER TABLE trees ADD COLUMN generation INTEGER NOT NULL DEFAULT 1");
+    }
+    if (!treeColumns.some((column) => column.name === "runtime_binding_json")) {
+      this.database.exec(
+        `ALTER TABLE trees ADD COLUMN runtime_binding_json TEXT NOT NULL DEFAULT '{"mode":"external"}'`,
+      );
     }
     if (!treeColumns.some((column) => column.name === "root_spawn_policy")) {
       this.database.exec(`ALTER TABLE trees ADD COLUMN root_spawn_policy TEXT NOT NULL DEFAULT 'none'

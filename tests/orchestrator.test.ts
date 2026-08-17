@@ -15,12 +15,43 @@ import type {
 } from "../src/herdr-client.ts";
 import { agentNameForNode, operationIdForRequest, requestHash } from "../src/ids.ts";
 import { type HerdrControl, SheltieOrchestrator } from "../src/orchestrator.ts";
-
+import {
+  REQUIRED_V0_HERDR_SOURCE_COMMIT,
+  REQUIRED_V0_OMP_SOURCE_COMMIT,
+  type RuntimeBinding,
+} from "../src/runtime-bundle.ts";
 const roots: string[] = [];
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
+
+const BUNDLED_RUNTIME_BINDING = {
+  mode: "bundled",
+  bundleRoot: "/bundle",
+  bundleDigest: "a".repeat(64),
+  bundleTarget: "linux-x64",
+  sessionName: "sheltie-0123456789abcdef01234567",
+  configHome: "/state/runtime/herdr/run-0123456789abcdef01234567/xdg-config",
+  socketPath:
+    "/state/runtime/herdr/run-0123456789abcdef01234567/xdg-config/herdr/sessions/sheltie-0123456789abcdef01234567/herdr.sock",
+  pathPrefix: "/bundle",
+  sheltie: { path: "/bundle/sheltie", sha256: "b".repeat(64) },
+  herdr: {
+    path: "/bundle/herdr",
+    sha256: "c".repeat(64),
+    sourceCommit: REQUIRED_V0_HERDR_SOURCE_COMMIT,
+    version: "0.8.0",
+    protocol: 20,
+  },
+  omp: {
+    path: "/bundle/omp",
+    sha256: "e".repeat(64),
+    sourceCommit: REQUIRED_V0_OMP_SOURCE_COMMIT,
+    version: "1.2.3",
+  },
+  okfCompaction: { path: "/bundle/sheltie-okf-compaction.js", sha256: "1".repeat(64) },
+} satisfies RuntimeBinding;
 
 function workspace(
   workspaceId: string,
@@ -72,6 +103,7 @@ function agent(nodeId: string, workspaceId: string, paneId: string): AgentInfo {
 
 class FakeHerdr implements HerdrControl {
   readonly worktreeCreates: Record<string, unknown>[] = [];
+  readonly tabCreates: Record<string, unknown>[] = [];
   readonly prompts: Array<{ target: string; text: string; client_operation_id?: string }> = [];
   readonly acceptedPromptOperations = new Set<string>();
   promptWrites = 0;
@@ -170,8 +202,30 @@ class FakeHerdr implements HerdrControl {
     });
   }
 
-  tabCreate(): Promise<never> {
-    return Promise.reject(new Error("tabCreate was not expected"));
+  tabCreate(params: {
+    workspace_id: string;
+    cwd?: string;
+    focus?: boolean;
+    label?: string;
+    env?: Record<string, string>;
+  }): Promise<{ type: "tab_created"; tab: TabInfo; root_pane: PaneInfo }> {
+    this.tabCreates.push(params);
+    const tab: TabInfo = {
+      workspace_id: params.workspace_id,
+      tab_id: `${params.workspace_id}:tab-${this.tabCreates.length}`,
+      ...(params.label === undefined ? {} : { label: params.label }),
+    };
+    const rootPane: PaneInfo = {
+      ...pane(params.workspace_id, `${tab.tab_id}:p1`),
+      tab_id: tab.tab_id,
+      ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
+    };
+    this.snapshotValue = {
+      ...this.snapshotValue,
+      tabs: [...this.snapshotValue.tabs, tab],
+      panes: [...this.snapshotValue.panes, rootPane],
+    };
+    return Promise.resolve({ type: "tab_created", tab, root_pane: rootPane });
   }
 
   tabRename(params: { tab_id: string; label: string }): Promise<{ type: "tab_info"; tab: TabInfo }> {
@@ -271,7 +325,7 @@ function seedStore(): { store: SheltieStore; root: string } {
   return { store, root };
 }
 
-function seedRootWorkspaceStore(): { store: SheltieStore; root: string } {
+function seedRootWorkspaceStore(runtimeBinding?: RuntimeBinding): { store: SheltieStore; root: string } {
   const root = mkdtempSync(join(tmpdir(), "sheltie-root-workspace-"));
   roots.push(root);
   const store = new SheltieStore(join(root, "state.sqlite"));
@@ -285,8 +339,9 @@ function seedRootWorkspaceStore(): { store: SheltieStore; root: string } {
     herdrProtocol: 20,
     baseCommit: "a".repeat(40),
     worktreeRoot: join(root, "worktrees"),
-    status: "active",
+    ...(runtimeBinding === undefined ? {} : { runtimeBinding }),
     rootTaskContract: "create the root result",
+    status: "active",
   });
   store.reserveNode({
     nodeId: "node-root-workspace",
@@ -339,6 +394,129 @@ describe("node provisioning", () => {
     store.close();
   });
 });
+
+describe("workspace environment propagation", () => {
+  test("binds the controlled environment to root and tabs while external operation requests keep their shape", async () => {
+    const { store, root } = seedRootWorkspaceStore();
+    const herdr = new FakeHerdr();
+    const workspaceEnvironment = {
+      PATH: "/runtime/bundle",
+      SHELTIE_RUN_ID: "untrusted-run",
+      SHELTIE_NODE_ID: "untrusted-node",
+      SHELTIE_PARENT_NODE_ID: "untrusted-parent",
+    };
+    const orchestrator = new SheltieOrchestrator(store, herdr, {
+      sheltieExecutable: join(root, "sheltie"),
+      workspaceEnvironment,
+    });
+    const rootNode = store.getNode("node-root-workspace");
+
+    await orchestrator.provisionNode(rootNode.nodeId);
+
+    const rootRequest = {
+      cwd: "/tmp/repo",
+      focus: false,
+      label: rootNode.nodeId,
+      env: {
+        PATH: "/runtime/bundle",
+        SHELTIE_RUN_ID: "run-root-workspace",
+        SHELTIE_NODE_ID: rootNode.nodeId,
+        SHELTIE_PARENT_NODE_ID: "untrusted-parent",
+      },
+    };
+    const rootOperationId = operationIdForRequest(rootNode.treeId, "workspace_create", rootNode.nodeId);
+    expect(herdr.workspaceCreates).toEqual([rootRequest]);
+    expect(store.getOperation(rootOperationId).request).toEqual(rootRequest);
+
+    const worktreeNode = store.reserveNode({
+      nodeId: "node-worktree-child",
+      treeId: rootNode.treeId,
+      parentNodeId: rootNode.nodeId,
+      name: "worker",
+      depth: 1,
+      placement: "workspace",
+      spawnPolicy: "none",
+      branch: "sheltie/root-workspace/worker",
+      baseCommit: "a".repeat(40),
+      worktreePath: join(root, "worktrees", "worker"),
+      taskContract: "work",
+    });
+    await orchestrator.provisionNode(worktreeNode.nodeId);
+    expect(herdr.worktreeCreates).toEqual([
+      {
+        workspace_id: "w-root-1",
+        branch: worktreeNode.branch,
+        base: worktreeNode.baseCommit,
+        path: worktreeNode.worktreePath,
+        label: worktreeNode.name,
+        focus: false,
+      },
+    ]);
+
+    const tabNode = store.reserveNode({
+      nodeId: "node-tab-child",
+      treeId: rootNode.treeId,
+      parentNodeId: rootNode.nodeId,
+      name: "reviewer",
+      depth: 1,
+      placement: "tab",
+      spawnPolicy: "none",
+      branch: rootNode.branch,
+      baseCommit: rootNode.baseCommit,
+      worktreePath: rootNode.worktreePath,
+      taskContract: "review",
+    });
+    await orchestrator.provisionNode(tabNode.nodeId);
+
+    const tabRequest = {
+      workspace_id: "w-root-1",
+      cwd: rootNode.worktreePath,
+      focus: false,
+      label: `${tabNode.name}-${tabNode.nodeId.slice(-8)}`,
+      env: {
+        PATH: "/runtime/bundle",
+        SHELTIE_RUN_ID: "run-root-workspace",
+        SHELTIE_NODE_ID: tabNode.nodeId,
+        SHELTIE_PARENT_NODE_ID: rootNode.nodeId,
+      },
+    };
+    const tabOperationId = operationIdForRequest(tabNode.treeId, "tab_create", tabNode.nodeId);
+    expect(herdr.tabCreates).toEqual([tabRequest]);
+    expect(store.getOperation(tabOperationId).request).toEqual(tabRequest);
+    store.close();
+  });
+  test("includes bundled runtime identity in the workspace operation ledger without changing the Herdr request", async () => {
+    const { store, root } = seedRootWorkspaceStore(BUNDLED_RUNTIME_BINDING);
+    const herdr = new FakeHerdr();
+    const orchestrator = new SheltieOrchestrator(store, herdr, {
+      sheltieExecutable: join(root, "sheltie"),
+      workspaceEnvironment: { PATH: "/bundle:/usr/bin" },
+    });
+    const node = store.getNode("node-root-workspace");
+    expect(store.getTree(node.treeId).runtimeBinding).toEqual(BUNDLED_RUNTIME_BINDING);
+    const herdrRequest = {
+      cwd: "/tmp/repo",
+      focus: false,
+      label: node.nodeId,
+      env: {
+        PATH: "/bundle:/usr/bin",
+        SHELTIE_RUN_ID: "run-root-workspace",
+        SHELTIE_NODE_ID: node.nodeId,
+      },
+    };
+
+    await orchestrator.provisionNode(node.nodeId);
+
+    const operationId = operationIdForRequest(node.treeId, "workspace_create", node.nodeId);
+    expect(herdr.workspaceCreates).toEqual([herdrRequest]);
+    expect(store.getOperation(operationId)).toMatchObject({
+      requestHash: requestHash({ ...herdrRequest, runtimeBinding: BUNDLED_RUNTIME_BINDING }),
+      request: { ...herdrRequest, runtimeBinding: BUNDLED_RUNTIME_BINDING },
+    });
+    store.close();
+  });
+});
+
 
 describe("root workspace identity", () => {
   test("rebinds one response-lost root workspace by its deterministic node label", async () => {
@@ -536,6 +714,8 @@ describe("prompt operation idempotency", () => {
     expect(prompt.match(/--caller-pane "\$HERDR_PANE_ID"/g)).toHaveLength(8);
     expect(prompt).not.toContain("--agent-session");
     expect(prompt).not.toContain("--parent-pane");
+    expect(prompt).not.toContain("SHELTIE_OKF_PRECOMMIT_COMMAND");
+    expect(prompt).not.toContain("SHELTIE_OKF_PRECOMMIT_ARGS");
     expect(store.claimStep(first.operationId, "session-node-root")).toEqual({ outcome: "claimed" });
     expect(store.claimStep(first.operationId, "other-session")).toEqual({ outcome: "conflict" });
     store.close();

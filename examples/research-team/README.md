@@ -27,11 +27,13 @@ The private `.sheltie-state/` directory is runtime state, not a team artifact. I
 
 `spec.knowledge.compaction` selects `coordinator` and `team` at `thresholdPercent: 70` using `okf-v0.2`. Selection is limited to unique OMP roles that are the root or can spawn children; `researcher` and `reviewer` are leaf roles and remain unselected.
 
-Selected roles use an owner-private `context-full` overlay with `remoteEnabled: false`, `thresholdPercent: 70`, `thresholdTokens: -1`, and `autoContinue: true`; OMP uses local context-full summarization and honors `session.compacting` marker context. The configured automatic-compaction extension is staged as a private copy before OMP starts, and only that staged extension is passed to OMP.
+Selected roles use an owner-private `context-full` overlay with `remoteEnabled: false`, `thresholdPercent: 70`, `thresholdTokens: -1`, and `autoContinue: true`. The configured automatic-compaction extension is staged as a private copy before OMP starts, and only that staged extension is passed to OMP.
 
-During an automatic compaction, only the bounded `<sheltie-okf>...</sheltie-okf>` marker is considered. Each selected node gets a private OKF v0.2 bundle containing `index.md` and an idempotent `concepts/compaction-<digest>.md` draft concept. Concepts are private, unverified drafts with portable non-file provenance, not SQLite/run authority; the raw surrounding summary or raw transcript is never copied.
+For each normal automatic `context-full` summary commit, OMP derives the proposed compaction entry and awaits the staged extension's `session_compaction_precommit` listener before it appends the entry or replaces live session context. A valid bounded `<sheltie-okf>...</sheltie-okf>` marker becomes one private OKF v0.2 handoff with `index.md` and an idempotent `concepts/compaction-<digest>.md` draft concept. The write completes before listener resolution. Write failures reject the listener and abort the compaction attempt; unsafe markers cancel the attempt without a partial artifact, while a missing marker is a no-op. There is no post-compaction persistence fallback. OMP's separate handoff, shake/elide, image-drop, and dead-end recovery rewrites do not emit this event.
 
-Pattern screening is bounded and best-effort, not exhaustive path, credential, runtime-ID, or secret detection. Empty or oversized marker content, wikilinks, traversal/tilde/SSH path signals, credential-like patterns, JWTs, runtime IDs or UUIDs, and long token/hash-like values produce no partial concept. Processes running as the same Unix user remain outside Sheltie's hard security boundary. Knowledge or extension write failures are logged and do not abort compaction, so artifact emission may be skipped. Cleanup preserves knowledge bundles.
+The concept is durable external knowledge, not live OMP context, SQLite/run authority, or a mechanism for immediate bounded parent context. It does not replace the durable inbox or background-node delegation, and the raw surrounding summary or raw transcript is never copied.
+
+Pattern screening is bounded and best-effort, not exhaustive path, credential, runtime-ID, or secret detection. Empty or oversized marker content, wikilinks, traversal/tilde/SSH path signals, credential-like patterns, JWTs, runtime IDs or UUIDs, and long token/hash-like values fail closed without partial output. Processes running as the same Unix user remain outside Sheltie's hard security boundary. Cleanup preserves knowledge bundles.
 
 ## Mergeable team artifact
 
@@ -40,15 +42,20 @@ Pattern screening is bounded and best-effort, not exhaustive path, credential, r
 ## Prerequisites
 
 - Bun **1.3.13**, Git, and a clean disposable checkout.
-- A compatible local Herdr runtime (Herdr **0.8.0**, protocol **20**) with a reachable Unix socket. Set its path in the generic `$HERDR_SOCKET` variable.
-- An OMP Agent runtime that Herdr can start for the manifest roles.
-- The repository-built executable at `./dist/sheltie` and its sibling automatic-compaction extension at `./dist/sheltie-okf-compaction.js`.
+- For default bundled mode, a Linux-x64 runtime bundle with exact Sheltie, Herdr, OMP, and the automatic-compaction extension. Bundled mode does not use ambient `herdr` or `omp`.
+- For explicit external mode, compatible Herdr **0.8.0** / protocol **20**, a reachable Unix socket, and an OMP runtime that the external Herdr can start.
 
-From the repository root, install dependencies and build the executable if needed:
+From the repository root, build a bundle into an explicit directory:
 
 ```bash
 bun install
 bun run build
+bun scripts/build-runtime-bundle.ts \
+  --herdr-bin /path/to/herdr \
+  --herdr-commit <herdr-source-commit> \
+  --omp-bin /path/to/omp \
+  --omp-commit <omp-source-commit> \
+  --output ./sheltie-runtime
 ```
 
 ## Validate and start
@@ -60,10 +67,20 @@ Validate the canonical manifest before starting:
   --file examples/research-team/sheltie.yaml
 ```
 
-Start from the clean disposable checkout. Sheltie creates the private state directory when it is missing:
+Start from the clean disposable checkout. Sheltie creates the private state directory when it is missing. With no socket, it starts the fresh run-owned Herdr session from this bundle:
+
+```bash
+./sheltie-runtime/sheltie run start \
+  --manifest examples/research-team/sheltie.yaml \
+  --repo . \
+  --state .sheltie-state
+```
+
+To use an already-running external Herdr session instead, make that mode explicit:
 
 ```bash
 ./dist/sheltie run start \
+  --runtime external \
   --manifest examples/research-team/sheltie.yaml \
   --repo . \
   --herdr-socket "$HERDR_SOCKET" \
@@ -75,8 +92,9 @@ Start from the clean disposable checkout. Sheltie creates the private state dire
 Use lifecycle and observation commands to inspect the run:
 
 ```bash
-./dist/sheltie run status --state .sheltie-state
-./dist/sheltie observe snapshot --state .sheltie-state
+./sheltie-runtime/sheltie run status --state .sheltie-state
+./sheltie-runtime/sheltie runtime status --state .sheltie-state
+./sheltie-runtime/sheltie observe snapshot --state .sheltie-state
 ```
 
 ## Cleanup
@@ -84,9 +102,9 @@ Use lifecycle and observation commands to inspect the run:
 Cleanup is operator-sensitive. The default preview returns the exact plan digest and aggregate counts without machine-local targets. Inspect those exact targets only through an explicit unsafe preview, then apply the reviewed plan with its digest:
 
 ```bash
-./dist/sheltie run cleanup --state .sheltie-state
-./dist/sheltie run cleanup --state .sheltie-state --unsafe-output
-./dist/sheltie run cleanup \
+./sheltie-runtime/sheltie run cleanup --state .sheltie-state
+./sheltie-runtime/sheltie run cleanup --state .sheltie-state --unsafe-output
+./sheltie-runtime/sheltie run cleanup \
   --state .sheltie-state \
   --apply \
   --plan-digest "$PLAN_DIGEST"
