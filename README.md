@@ -45,6 +45,18 @@ The resulting protocol is intentionally conservative: reserve before mutating, r
 - Projects a product-safe `ObservationSnapshot` and includes an optional read-only Herdr Cockpit.
 - Requires an explicit, exact-target cleanup plan before removing run-owned runtime resources.
 
+## Demo
+
+This recording is a real bundled run: one coordinator starts researcher and reviewer OMP Agents in parallel tabs, receives both durable inbox results, completes the three-node tree, quiesces the Agents, and applies digest-bound cleanup.
+
+[![Watch the Sheltie live demo](https://asciinema.org/a/DIAhNi9DD1vaC1v9.svg)](https://asciinema.org/a/DIAhNi9DD1vaC1v9)
+
+The audited cast is also committed for local playback:
+
+```bash
+asciinema play demo/sheltie.cast
+```
+
 ## Architecture
 
 ```text
