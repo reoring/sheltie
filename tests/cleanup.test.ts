@@ -67,6 +67,7 @@ class FakeCleanupHerdr implements CleanupHerdrControl {
   readonly unrelatedWorkspaceId = "w-unrelated";
   snapshotValue: SessionSnapshot;
   worktrees: WorktreeInfo[];
+  worktreeListSource: { repo_root: string; source_workspace_id?: string };
 
   constructor(
     readonly repoRoot: string,
@@ -100,6 +101,7 @@ class FakeCleanupHerdr implements CleanupHerdrControl {
         label: "child",
       },
     ];
+    this.worktreeListSource = { repo_root: repoRoot, source_workspace_id: "w-root" };
   }
 
   ping(): Promise<PongResult> {
@@ -117,7 +119,7 @@ class FakeCleanupHerdr implements CleanupHerdrControl {
   }> {
     return Promise.resolve({
       type: "worktree_list",
-      source: { repo_root: this.repoRoot, source_workspace_id: "w-root" },
+      source: { ...this.worktreeListSource },
       worktrees: structuredClone(this.worktrees),
     });
   }
@@ -390,6 +392,82 @@ describe("CleanupController", () => {
     ]);
     expect(fixture.store.listCleanupReceipts(plan.planDigest)).toHaveLength(3);
     expect(fixture.store.listMessages("tree-cleanup").map((message) => message.body)).toEqual(["review complete"]);
+    fixture.store.close();
+  });
+
+  test("accepts a protocol-20 source workspace without optional snapshot worktree metadata", async () => {
+    const fixture = await createFixture();
+    fixture.herdr.snapshotValue.workspaces = fixture.herdr.snapshotValue.workspaces.map((candidate) => {
+      if (candidate.workspace_id !== "w-root") return candidate;
+      const { worktree: _worktree, ...sourceWithoutWorktree } = candidate;
+      return sourceWithoutWorktree;
+    });
+    const controller = new CleanupController(fixture.store, fixture.herdr);
+    const plan = await controller.preview();
+
+    expect(plan.blockers).toEqual([]);
+    expect(plan.actions).toContainEqual(
+      expect.objectContaining({
+        kind: "close_source_workspace",
+        workspaceId: "w-root",
+        repoRoot: fixture.repoRoot,
+      }),
+    );
+    await expect(controller.apply(plan.planDigest)).resolves.toMatchObject({
+      tree: { status: "cleaned" },
+    });
+    fixture.store.close();
+  });
+
+  test("blocks a present source workspace with mismatched worktree metadata", async () => {
+    const fixture = await createFixture();
+    fixture.herdr.snapshotValue.workspaces = fixture.herdr.snapshotValue.workspaces.map((candidate) =>
+      candidate.workspace_id === "w-root"
+        ? {
+            ...candidate,
+            worktree: {
+              repo_root: "/wrong/repository",
+              checkout_path: fixture.repoRoot,
+              is_linked_worktree: false,
+            },
+          }
+        : candidate,
+    );
+    const plan = await new CleanupController(fixture.store, fixture.herdr).preview();
+
+    expect(plan.blockers).toContain("DB repository source workspace does not match Herdr snapshot");
+    fixture.store.close();
+  });
+
+  test("blocks a present linked source workspace worktree", async () => {
+    const fixture = await createFixture();
+    fixture.herdr.snapshotValue.workspaces = fixture.herdr.snapshotValue.workspaces.map((candidate) =>
+      candidate.workspace_id === "w-root"
+        ? {
+            ...candidate,
+            worktree: {
+              repo_root: fixture.repoRoot,
+              checkout_path: fixture.repoRoot,
+              is_linked_worktree: true,
+            },
+          }
+        : candidate,
+    );
+    const plan = await new CleanupController(fixture.store, fixture.herdr).preview();
+
+    expect(plan.blockers).toContain("DB repository source workspace does not match Herdr snapshot");
+    fixture.store.close();
+  });
+
+  test("blocks cleanup when the worktree-list source does not attest the source workspace", async () => {
+    const fixture = await createFixture();
+    fixture.herdr.worktreeListSource = {
+      repo_root: fixture.repoRoot,
+      source_workspace_id: "w-other",
+    };
+    const plan = await new CleanupController(fixture.store, fixture.herdr).preview();
+
+    expect(plan.blockers).toContain("DB repository source identity does not match Herdr worktree source");
     fixture.store.close();
   });
 

@@ -583,12 +583,16 @@ export class CleanupController {
     const matches = inventory.snapshot.workspaces.filter(
       (candidate) => candidate.workspace_id === tree.repoSourceWorkspaceId,
     );
-    const source = matches[0];
+    if (matches.length !== 1) {
+      blockers.push("DB repository source workspace does not match Herdr snapshot");
+      return;
+    }
+    const worktree = matches[0]?.worktree;
     if (
-      matches.length !== 1 ||
-      source?.worktree?.repo_root !== tree.repoRoot ||
-      source.worktree.checkout_path !== tree.repoRoot ||
-      source.worktree.is_linked_worktree
+      worktree !== undefined &&
+      (worktree.repo_root !== tree.repoRoot ||
+        worktree.checkout_path !== tree.repoRoot ||
+        worktree.is_linked_worktree)
     ) {
       blockers.push("DB repository source workspace does not match Herdr snapshot");
     }
@@ -790,10 +794,15 @@ export class CleanupController {
       if (!sameValues(paneIds, action.paneIds) || !sameValues(tabIds, action.tabIds)) {
         throw new Error(`source workspace ${action.workspaceId} pane identity changed after preview`);
       }
+      const worktree = source?.worktree;
       if (
         matches.length !== 1 ||
-        source?.worktree?.checkout_path !== action.repoRoot ||
-        source.worktree.is_linked_worktree
+        current.listed.source.repo_root !== action.repoRoot ||
+        current.listed.source.source_workspace_id !== action.workspaceId ||
+        (worktree !== undefined &&
+          (worktree.repo_root !== action.repoRoot ||
+            worktree.checkout_path !== action.repoRoot ||
+            worktree.is_linked_worktree))
       ) {
         throw new Error(`source workspace ${action.workspaceId} identity changed after preview`);
       }
