@@ -15,25 +15,25 @@ A bundle directory contains exactly this manifest and its flat sibling artifacts
   sheltie-okf-compaction.js
 ```
 
-`runtime-manifest.json` records the API version, target (`linux-x64`), source commits, Herdr version/protocol, and SHA-256 identity for every artifact. Artifact entries are relative basenames only; traversal and symlinked artifacts are rejected. Resolution canonicalizes the selected bundle root with `realpath(2)` before constructing, verifying, or persisting any artifact path, then verifies the manifest and every artifact hash before use.
+`runtime-manifest.json` records the API version, target (`linux-x64`), artifact-reported source commits, Herdr version/protocol, and SHA-256 identity for every artifact. Artifact entries are relative basenames only; traversal and symlinked artifacts are rejected. Resolution canonicalizes the selected bundle root with `realpath(2)` before constructing, verifying, or persisting any artifact path, then verifies the manifest and every artifact hash before use.
 
-The bundle must contain **both Herdr and OMP**. v0 accepts exactly Herdr commit `7f82d033663ebcf616dcf127ca75b549da9352e4` and OMP commit `66cd13910c0519269332fe31b1f58b16ef2a9da6`; a different full source SHA is still incompatible. Bundled Herdr sets its server-owned `HERDR_AGENT_OMP_PATH` to the verified OMP absolute artifact path, so `agent.kind: omp` commands launch that exact executable even if interactive-shell startup rewrites `PATH`. Bundled mode also prepends the verified bundle root to `PATH` for subordinate commands launched by OMP; it never falls back to ambient `herdr` or `omp`.
+The bundle must contain **both Herdr and OMP**. v0 accepts only an artifact that reports Herdr commit `ea766d5a70d53ad66028d980fb43b5808947ea71` or OMP commit `90fd6477137fc38c5257f11ad13d9b031b39c526`; a different full source SHA is incompatible. Bundled Herdr sets its server-owned `HERDR_AGENT_OMP_PATH` to the verified OMP absolute artifact path, so `agent.kind: omp` commands launch that exact executable even if interactive-shell startup rewrites `PATH`. Bundled mode also prepends the verified bundle root to `PATH` for subordinate commands launched by OMP; it never falls back to ambient `herdr` or `omp`.
 
 ## Build a bundle
 
-First run the ordinary build, then use the builder with the exact binary artifacts and source commits:
+First run the ordinary build, then use the builder with the exact binary artifacts:
 
 ```bash
 bun run build
 bun scripts/build-runtime-bundle.ts \
   --herdr-bin /path/to/herdr \
-  --herdr-commit 7f82d033663ebcf616dcf127ca75b549da9352e4 \
   --omp-bin /path/to/omp \
-  --omp-commit 66cd13910c0519269332fe31b1f58b16ef2a9da6 \
   --output ./sheltie-runtime
 ```
 
-The builder rejects source-commit arguments other than the two exact v0 revisions. It copies `dist/sheltie` and `dist/sheltie-okf-compaction.js`, copies the exact Herdr and OMP binaries, marks executable artifacts executable, hashes them, and writes the canonical manifest. Each artifact’s `--version` probe has a deadline; timeout or probe failure terminates and awaits the exact child, escalating from `SIGTERM` to `SIGKILL`. The equivalent package entry point is `bun run build:bundle -- --herdr-bin … --herdr-commit … --omp-bin … --omp-commit …`. `bun run build` stays independent of runtime artifacts.
+Before probing, the builder privately copies all four input artifacts into a temporary directory beneath a trusted output parent. It invokes `--build-info` only on the staged Herdr and OMP artifacts and accepts only stdout containing one JSONL object with schema `sheltie.runtime-build-info/v1` and no other output. Herdr must report `name: "herdr"`, version `0.8.0`, protocol `20`, and its required source commit; OMP must report `name: "omp"`, a semantic version, and its required source commit. Both probes start concurrently, and the builder waits for both to settle before reporting either failure. It rejects malformed, multiline, or extra output, incompatible records, nonzero exits, and timeouts; timeout or probe failure terminates and awaits each exact child, escalating from `SIGTERM` to `SIGKILL`.
+
+After both probes validate, the builder hashes the staged artifacts and atomically renames that exact directory into the final bundle. On any failure it removes the staging directory and leaves no bundle output. There are no source-commit arguments: manifest `sourceCommit` values come only from the validated artifact records. The SHA-256 recorded for each artifact therefore binds that artifact-reported claim to the exact published bytes. This validates the bytes' embedded claim, not the authenticity of the build pipeline that produced them; obtain the binaries through a separately trusted build and distribution path. The equivalent package entry point is `bun run build:bundle -- --herdr-bin … --omp-bin …`. `bun run build` stays independent of runtime artifacts.
 
 The builder verifies identity and target metadata but does not make dynamically linked binaries portable. Supply artifacts built for the destination Linux environment, or statically linked/otherwise self-contained artifacts when the bundle must move between hosts. A Devbox/Nix-linked local binary may depend on that machine’s Nix store and is suitable for local smoke use only; the manifest hash does not embed missing loader or shared-library dependencies.
 

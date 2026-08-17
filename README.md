@@ -85,18 +85,16 @@ bun install
 bun run build
 ```
 
-`bun run build` writes `dist/sheltie` and its sibling automatic-compaction extension `dist/sheltie-okf-compaction.js`; it does not require runtime inputs. To create a distributable Linux-x64 runtime bundle after that normal build, provide the exact Herdr and OMP artifacts and their source commits:
+`bun run build` writes `dist/sheltie` and its sibling automatic-compaction extension `dist/sheltie-okf-compaction.js`; it does not require runtime inputs. To create a distributable Linux-x64 runtime bundle after that normal build, provide the exact Herdr and OMP binary artifacts. The builder accepts provenance only from each artifact's sole `--build-info` JSONL record; it does not accept source-commit flags.
 
 ```bash
 bun scripts/build-runtime-bundle.ts \
   --herdr-bin /path/to/herdr \
-  --herdr-commit <herdr-source-commit> \
   --omp-bin /path/to/omp \
-  --omp-commit <omp-source-commit> \
   --output ./sheltie-runtime
 ```
 
-`bun run build:bundle -- --herdr-bin … --herdr-commit … --omp-bin … --omp-commit …` is the equivalent build-script entry point. The output is a flat bundle; see [Runtime bundles](docs/runtime-bundles.md) for its layout and lifecycle.
+The manifest records the validated embedded source claims and each copied artifact's SHA-256. The hash binds a reported claim to exact bytes, while trust in the build pipeline that produced those bytes is a separate decision. `bun run build:bundle -- --herdr-bin … --omp-bin …` is the equivalent build-script entry point. The output is a flat bundle; see [Runtime bundles](docs/runtime-bundles.md) for its layout and lifecycle.
 
 ## Automatic compaction knowledge
 

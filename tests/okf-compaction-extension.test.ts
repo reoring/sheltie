@@ -24,6 +24,7 @@ const REQUIRED_FLAGS = ["sheltie-okf-dir", "sheltie-okf-role"] as const;
 const INVALID_MARKER_REASON = "okf_marker_invalid";
 type RelevantEvent = (typeof RELEVANT_EVENTS)[number];
 type EventHandler = (event: unknown, context: unknown) => unknown;
+type Durability = NonNullable<Parameters<typeof okfCompactionExtension>[1]>;
 
 interface RegisteredFlag {
   type: "string" | "boolean";
@@ -77,12 +78,31 @@ function createFixture(): Fixture {
   return { root, outputDir: join(root, "knowledge", "node-0123456789abcdef") };
 }
 
-async function loadExtension(outputDir: string): Promise<FakeExtensionApi> {
+async function loadExtension(outputDir: string, durability?: Durability): Promise<FakeExtensionApi> {
   const api = new FakeExtensionApi();
-  await okfCompactionExtension(api as never);
+  await okfCompactionExtension(api as never, durability);
   api.setFlag("sheltie-okf-dir", outputDir);
   api.setFlag("sheltie-okf-role", "coordinator");
   return api;
+}
+
+function recordingDurability(
+  events: string[],
+  shouldFail?: (event: string) => boolean,
+): Durability {
+  const record = (kind: "file" | "directory", path: string): void => {
+    const event = `${kind}:${path}`;
+    events.push(event);
+    if (shouldFail?.(event)) throw new Error("simulated fsync failure");
+  };
+  return {
+    async syncFile(_file, path) {
+      record("file", path);
+    },
+    async syncDirectory(_directory, path) {
+      record("directory", path);
+    },
+  };
 }
 
 function automaticStart() {
@@ -226,7 +246,8 @@ describe("OKF automatic-compaction extension", () => {
 
   test("persists valid automatic marker content before append and rebuild", async () => {
     const fixture = createFixture();
-    const api = await loadExtension(fixture.outputDir);
+    const syncEvents: string[] = [];
+    const api = await loadExtension(fixture.outputDir, recordingDurability(syncEvents));
     const markerContent = [
       "# Compaction boundary",
       "",
@@ -236,6 +257,15 @@ describe("OKF automatic-compaction extension", () => {
     ].join("\n");
     const summary = summaryWithMarker(markerContent);
     const conceptName = `compaction-${createHash("sha256").update(markerContent, "utf8").digest("hex")}.md`;
+    const conceptPath = join(fixture.outputDir, "concepts", conceptName);
+    const conceptsDirectory = join(fixture.outputDir, "concepts");
+    const indexPath = join(fixture.outputDir, "index.md");
+    const conceptTemporarySyncPrefix = `file:${join(conceptsDirectory, `.${conceptName}.tmp-`)}`;
+    const indexTemporarySyncPrefix = `file:${join(fixture.outputDir, ".index.md.tmp-")}`;
+    const conceptFileSync = `file:${conceptPath}`;
+    const conceptsDirectorySync = `directory:${conceptsDirectory}`;
+    const indexFileSync = `file:${indexPath}`;
+    const outputDirectorySync = `directory:${fixture.outputDir}`;
     let context = "context-before-append";
 
     await api.emit("auto_compaction_start", automaticStart());
@@ -243,20 +273,41 @@ describe("OKF automatic-compaction extension", () => {
     const result = await emitPrecommitBeforeAppend(api, summary, () => {
       expect(context).toBe("context-before-append");
       expect(conceptNames(fixture.outputDir)).toEqual([conceptName]);
-      expect(existsSync(join(fixture.outputDir, "index.md"))).toBe(true);
+      expect(existsSync(indexPath)).toBe(true);
+      const appendIndex = syncEvents.push("append") - 1;
+      const conceptTemporarySyncIndex = syncEvents.findIndex((event) =>
+        event.startsWith(conceptTemporarySyncPrefix),
+      );
+      const conceptsDirectorySyncIndex = syncEvents.findIndex(
+        (event, index) => index > conceptTemporarySyncIndex && event === conceptsDirectorySync,
+      );
+      const indexTemporarySyncIndex = syncEvents.findIndex((event) =>
+        event.startsWith(indexTemporarySyncPrefix),
+      );
+      const outputDirectorySyncIndex = syncEvents.findIndex(
+        (event, index) => index > indexTemporarySyncIndex && event === outputDirectorySync,
+      );
+      for (const syncIndex of [
+        conceptTemporarySyncIndex,
+        conceptsDirectorySyncIndex,
+        indexTemporarySyncIndex,
+        outputDirectorySyncIndex,
+      ]) {
+        expect(syncIndex).toBeGreaterThanOrEqual(0);
+        expect(syncIndex).toBeLessThan(appendIndex);
+      }
       context = "context-after-rebuild";
     });
 
     expect(result).toBeUndefined();
     expect(context).toBe("context-after-rebuild");
 
-    const index = readFileSync(join(fixture.outputDir, "index.md"), "utf8");
+    const index = readFileSync(indexPath, "utf8");
     expect(index).toMatch(/^---\nokf_version:\s*["']?0\.2["']?\n---/);
     expect(index).toContain("Private, derived OKF concepts written during automatic context compaction.");
     expect(index).toContain("[Content-addressed concepts](./concepts/)");
     expect(index).not.toContain(conceptName);
 
-    const conceptPath = join(fixture.outputDir, "concepts", conceptName);
     const concept = readFileSync(conceptPath, "utf8");
     const metadata = frontmatter(concept);
     expect(metadata).toMatch(/^type:\s+\S/m);
@@ -284,7 +335,28 @@ describe("OKF automatic-compaction extension", () => {
     expect(concept).not.toContain("[[");
 
     const firstConcept = readFileSync(conceptPath, "utf8");
-    await api.emit("session_compaction_precommit", precommitEvent(summary, "2026-08-15T01:00:00.000Z"));
+    syncEvents.length = 0;
+    const repeatedResult = await emitPrecommitBeforeAppend(api, summary, () => {
+      const appendIndex = syncEvents.push("append") - 1;
+      const conceptFileSyncIndex = syncEvents.indexOf(conceptFileSync);
+      const conceptsDirectorySyncIndex = syncEvents.findIndex(
+        (event, index) => index > conceptFileSyncIndex && event === conceptsDirectorySync,
+      );
+      const indexFileSyncIndex = syncEvents.indexOf(indexFileSync);
+      const outputDirectorySyncIndex = syncEvents.findIndex(
+        (event, index) => index > indexFileSyncIndex && event === outputDirectorySync,
+      );
+      for (const syncIndex of [
+        conceptFileSyncIndex,
+        conceptsDirectorySyncIndex,
+        indexFileSyncIndex,
+        outputDirectorySyncIndex,
+      ]) {
+        expect(syncIndex).toBeGreaterThanOrEqual(0);
+        expect(syncIndex).toBeLessThan(appendIndex);
+      }
+    });
+    expect(repeatedResult).toBeUndefined();
     expect(conceptNames(fixture.outputDir)).toEqual([conceptName]);
     expect(readFileSync(conceptPath, "utf8")).toBe(firstConcept);
 
@@ -364,6 +436,30 @@ describe("OKF automatic-compaction extension", () => {
       expect(conceptNames(fixture.outputDir)).toEqual([]);
       expect(existsSync(join(fixture.outputDir, "index.md"))).toBe(false);
     }
+  });
+
+  test("rejects precommit before append when a durability sync fails", async () => {
+    const fixture = createFixture();
+    const syncEvents: string[] = [];
+    const api = await loadExtension(
+      fixture.outputDir,
+      recordingDurability(syncEvents, (event) => event.startsWith("file:")),
+    );
+    const markerContent = "# Durable concept\n\nThis must not append if fsync fails.";
+    let context = "context-before-append";
+
+    await api.emit("auto_compaction_start", automaticStart());
+    markerInstruction(await api.emit("session.compacting", compactingEvent()));
+    await expect(
+      emitPrecommitBeforeAppend(api, summaryWithMarker(markerContent), () => {
+        context = "context-after-rebuild";
+      }),
+    ).rejects.toThrow("okf_persistence_failed");
+
+    expect(context).toBe("context-before-append");
+    expect(syncEvents.some((event) => event.startsWith("file:"))).toBe(true);
+    expect(conceptNames(fixture.outputDir)).toEqual([]);
+    expect(existsSync(join(fixture.outputDir, "index.md"))).toBe(false);
   });
 
   test("publishes concurrent automatic concepts through immutable files and a byte-stable static index", async () => {

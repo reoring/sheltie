@@ -45,16 +45,14 @@ Pattern screening is bounded and best-effort, not exhaustive path, credential, r
 - For default bundled mode, a Linux-x64 runtime bundle with exact Sheltie, Herdr, OMP, and the automatic-compaction extension. Bundled mode does not use ambient `herdr` or `omp`.
 - For explicit external mode, compatible Herdr **0.8.0** / protocol **20**, a reachable Unix socket, and an OMP runtime that the external Herdr can start.
 
-From the repository root, build a bundle into an explicit directory:
+From the repository root, build a bundle into an explicit directory. The builder reads provenance only from each binary's validated `--build-info` record:
 
 ```bash
 bun install
 bun run build
 bun scripts/build-runtime-bundle.ts \
   --herdr-bin /path/to/herdr \
-  --herdr-commit <herdr-source-commit> \
   --omp-bin /path/to/omp \
-  --omp-commit <omp-source-commit> \
   --output ./sheltie-runtime
 ```
 

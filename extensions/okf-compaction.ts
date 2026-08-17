@@ -78,6 +78,21 @@ interface OmpExtensionApi {
   on(event: ExtensionEvent["type"], handler: EventHandler): void;
 }
 
+export interface OkfCompactionDurability {
+  syncFile(file: FileHandle, path: string): Promise<void>;
+  syncDirectory(directory: FileHandle, path: string): Promise<void>;
+}
+
+const DEFAULT_DURABILITY: OkfCompactionDurability = {
+  syncFile(file) {
+    return file.sync();
+  },
+  syncDirectory(directory) {
+    return directory.sync();
+  },
+};
+
+
 interface CompactionState {
   activeAutomaticContextFull: boolean;
   outputDirectory: string | undefined;
@@ -320,10 +335,26 @@ async function unlinkLockIfUnchanged(path: string, expected: LockFileSnapshot): 
   }
 }
 
-async function createLockNoOverwrite(path: string, owner: LockOwner): Promise<LockFileSnapshot> {
-  const temporaryPath = await writePrivateTemporaryFile(path, `${JSON.stringify(owner)}\n`);
+async function createLockNoOverwrite(
+  path: string,
+  owner: LockOwner,
+  durability: OkfCompactionDurability,
+): Promise<LockFileSnapshot> {
+  const temporaryPath = await writePrivateTemporaryFile(path, `${JSON.stringify(owner)}\n`, durability);
+  let linked = false;
   try {
     await link(temporaryPath, path);
+    linked = true;
+    await syncPrivateDirectory(dirname(path), durability);
+  } catch (error) {
+    if (linked) {
+      try {
+        await unlink(path);
+      } catch (cleanupError) {
+        if (errnoCode(cleanupError) !== "ENOENT") throw cleanupError;
+      }
+    }
+    throw error;
   } finally {
     try {
       await unlink(temporaryPath);
@@ -345,8 +376,113 @@ async function lockOwnerLiveness(owner: LockOwner): Promise<"live" | "stale" | "
   return "live";
 }
 
-async function ensurePrivateDirectory(path: string): Promise<string> {
+function directoryPathChain(path: string): string[] {
+  const paths: string[] = [];
+  let current = resolve(path);
+  for (;;) {
+    const parent = dirname(current);
+    if (parent === current) break;
+    paths.push(current);
+    current = parent;
+  }
+  return paths.reverse();
+}
+
+async function openPrivateRegularFileNoFollow(path: string): Promise<FileHandle> {
+  let file: FileHandle;
+  try {
+    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (errnoCode(error) === "ELOOP") throw new Error("OKF artifact must not be a symbolic link");
+    throw error;
+  }
+
+  try {
+    const details = await file.stat();
+    if (!details.isFile()) throw new Error("OKF artifact is not a regular file");
+    if (details.uid !== currentEffectiveUid()) {
+      throw new Error("OKF artifact is not owned by the effective user");
+    }
+    if ((details.mode & OWNER_ONLY_MODE_MASK) !== 0) {
+      throw new Error("OKF artifact is accessible to another user");
+    }
+    return file;
+  } catch (error) {
+    try {
+      await file.close();
+    } catch {
+      // The validation error already fails closed.
+    }
+    throw error;
+  }
+}
+
+async function openDirectoryNoFollow(path: string): Promise<FileHandle> {
+  let directory: FileHandle;
+  try {
+    directory = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (errnoCode(error) === "ELOOP") throw new Error("OKF output directory must not be a symbolic link");
+    throw error;
+  }
+
+  try {
+    if (!(await directory.stat()).isDirectory()) {
+      throw new Error("OKF output location is not a real directory");
+    }
+    return directory;
+  } catch (error) {
+    try {
+      await directory.close();
+    } catch {
+      // The validation error already fails closed.
+    }
+    throw error;
+  }
+}
+
+async function syncPrivateRegularFile(path: string, durability: OkfCompactionDurability): Promise<void> {
+  const file = await openPrivateRegularFileNoFollow(path);
+  try {
+    await durability.syncFile(file, path);
+  } finally {
+    await file.close();
+  }
+}
+
+async function syncPrivateDirectory(path: string, durability: OkfCompactionDurability): Promise<void> {
+  const directory = await openDirectoryNoFollow(path);
+  try {
+    await durability.syncDirectory(directory, path);
+  } finally {
+    await directory.close();
+  }
+}
+
+async function verifyAndSyncExistingArtifact(
+  path: string,
+  durability: OkfCompactionDurability,
+  verify: (contents: Buffer) => void,
+): Promise<void> {
+  const file = await openPrivateRegularFileNoFollow(path);
+  try {
+    verify(await file.readFile());
+    await durability.syncFile(file, path);
+  } finally {
+    await file.close();
+  }
+  await syncPrivateDirectory(dirname(path), durability);
+}
+
+async function ensurePrivateDirectory(
+  path: string,
+  durability: OkfCompactionDurability,
+): Promise<string> {
   const resolvedPath = resolve(path);
+  const missingDirectories: string[] = [];
+  for (const candidate of directoryPathChain(resolvedPath)) {
+    if ((await lstatIfPresent(candidate)) === null) missingDirectories.push(candidate);
+  }
   await mkdir(resolvedPath, { recursive: true, mode: DIRECTORY_MODE });
 
   const details = await lstat(resolvedPath);
@@ -362,6 +498,13 @@ async function ensurePrivateDirectory(path: string): Promise<string> {
   const securedDetails = await lstat(resolvedPath);
   if ((securedDetails.mode & OWNER_ONLY_MODE_MASK) !== 0) {
     throw new Error("OKF output directory is accessible to another user");
+  }
+
+  if (missingDirectories.length > 0) {
+    for (const createdDirectory of [...missingDirectories].reverse()) {
+      await syncPrivateDirectory(createdDirectory, durability);
+    }
+    await syncPrivateDirectory(dirname(missingDirectories[0]!), durability);
   }
 
   return resolvedPath;
@@ -383,7 +526,10 @@ async function ensurePrivateRegularFile(path: string): Promise<boolean> {
 
   return true;
 }
-async function acquireExclusiveLock(outputDirectory: string): Promise<() => Promise<void>> {
+async function acquireExclusiveLock(
+  outputDirectory: string,
+  durability: OkfCompactionDurability,
+): Promise<() => Promise<void>> {
   const lockPath = join(outputDirectory, ".okf-compaction.lock");
   const processStartToken = await readProcessStartToken(process.pid);
   if (processStartToken === null || processStartToken === undefined) {
@@ -397,7 +543,7 @@ async function acquireExclusiveLock(outputDirectory: string): Promise<() => Prom
 
   for (let attempt = 0; attempt < MAX_LOCK_ATTEMPTS; attempt += 1) {
     try {
-      const acquired = await createLockNoOverwrite(lockPath, owner);
+      const acquired = await createLockNoOverwrite(lockPath, owner, durability);
       return async () => {
         const current = await readPrivateLock(lockPath);
         if (current === null || !sameLockOwner(current.owner, owner)) return;
@@ -427,7 +573,11 @@ async function acquireExclusiveLock(outputDirectory: string): Promise<() => Prom
 
 let temporaryFileSequence = 0;
 
-async function writePrivateTemporaryFile(path: string, contents: string): Promise<string> {
+async function writePrivateTemporaryFile(
+  path: string,
+  contents: string,
+  durability: OkfCompactionDurability,
+): Promise<string> {
   const directory = dirname(path);
   const baseName = basename(path);
 
@@ -446,6 +596,7 @@ async function writePrivateTemporaryFile(path: string, contents: string): Promis
 
     try {
       await chmod(temporaryPath, FILE_MODE);
+      await syncPrivateRegularFile(temporaryPath, durability);
       return temporaryPath;
     } catch (error) {
       try {
@@ -458,13 +609,18 @@ async function writePrivateTemporaryFile(path: string, contents: string): Promis
   }
 }
 
-async function publishNoOverwrite(path: string, contents: string): Promise<void> {
-  const temporaryPath = await writePrivateTemporaryFile(path, contents);
+async function publishNoOverwrite(
+  path: string,
+  contents: string,
+  durability: OkfCompactionDurability,
+): Promise<void> {
+  const temporaryPath = await writePrivateTemporaryFile(path, contents, durability);
 
   try {
     try {
       await link(temporaryPath, path);
       await ensurePrivateRegularFile(path);
+      await syncPrivateDirectory(dirname(path), durability);
       return;
     } catch (error) {
       if (errnoCode(error) !== "EEXIST") throw error;
@@ -474,10 +630,11 @@ async function publishNoOverwrite(path: string, contents: string): Promise<void>
       throw new Error("OKF artifact disappeared while publishing");
     }
 
-    const existingContents = await readFile(path);
-    if (!existingContents.equals(Buffer.from(contents, "utf8"))) {
-      throw new Error("OKF artifact conflicts with an existing file");
-    }
+    await verifyAndSyncExistingArtifact(path, durability, (existingContents) => {
+      if (!existingContents.equals(Buffer.from(contents, "utf8"))) {
+        throw new Error("OKF artifact conflicts with an existing file");
+      }
+    });
   } finally {
     try {
       await unlink(temporaryPath);
@@ -486,49 +643,58 @@ async function publishNoOverwrite(path: string, contents: string): Promise<void>
     }
   }
 }
+
 async function publishConceptNoOverwrite(
   path: string,
   content: string,
   digest: string,
   timestamp: string,
+  durability: OkfCompactionDurability,
 ): Promise<void> {
   if (!(await ensurePrivateRegularFile(path))) {
-    await publishNoOverwrite(path, createConceptMarkdown(content, digest, timestamp));
+    await publishNoOverwrite(path, createConceptMarkdown(content, digest, timestamp), durability);
     return;
   }
 
-  const existingContents = await readFile(path, "utf8");
-  const existingTimestamp = eventTimestamp(existingContents.match(/^  at:\s*(.+)$/m)?.[1]);
-  if (
-    existingTimestamp === null ||
-    existingContents !== createConceptMarkdown(content, digest, existingTimestamp)
-  ) {
-    throw new Error("OKF artifact conflicts with an existing file");
-  }
+  await verifyAndSyncExistingArtifact(path, durability, (existingContents) => {
+    const existingMarkdown = existingContents.toString("utf8");
+    const existingTimestamp = eventTimestamp(existingMarkdown.match(/^  at:\s*(.+)$/m)?.[1]);
+    if (
+      existingTimestamp === null ||
+      !existingContents.equals(
+        Buffer.from(createConceptMarkdown(content, digest, existingTimestamp), "utf8"),
+      )
+    ) {
+      throw new Error("OKF artifact conflicts with an existing file");
+    }
+  });
 }
-
 
 async function persistConcept(
   outputDirectory: string,
   content: string,
   timestamp: string,
   signal: { aborted: boolean } | undefined,
+  durability: OkfCompactionDurability,
 ): Promise<void> {
   if (signal?.aborted) throw new Error("OKF precommit was cancelled");
 
-  const privateOutputDirectory = await ensurePrivateDirectory(outputDirectory);
-  const releaseLock = await acquireExclusiveLock(privateOutputDirectory);
+  const privateOutputDirectory = await ensurePrivateDirectory(outputDirectory, durability);
+  const releaseLock = await acquireExclusiveLock(privateOutputDirectory, durability);
 
   try {
     if (signal?.aborted) throw new Error("OKF precommit was cancelled");
 
-    const conceptsDirectory = await ensurePrivateDirectory(join(privateOutputDirectory, "concepts"));
+    const conceptsDirectory = await ensurePrivateDirectory(
+      join(privateOutputDirectory, "concepts"),
+      durability,
+    );
     const digest = conceptDigest(content);
     const conceptName = `compaction-${digest}.md`;
     const conceptPath = join(conceptsDirectory, conceptName);
 
-    await publishConceptNoOverwrite(conceptPath, content, digest, timestamp);
-    await publishNoOverwrite(join(privateOutputDirectory, "index.md"), createIndexMarkdown());
+    await publishConceptNoOverwrite(conceptPath, content, digest, timestamp, durability);
+    await publishNoOverwrite(join(privateOutputDirectory, "index.md"), createIndexMarkdown(), durability);
   } finally {
     await releaseLock();
   }
@@ -542,7 +708,10 @@ function safeLog(message: string): void {
   }
 }
 
-export default async function okfCompactionExtension(api: OmpExtensionApi): Promise<void> {
+export default async function okfCompactionExtension(
+  api: OmpExtensionApi,
+  durability: OkfCompactionDurability = DEFAULT_DURABILITY,
+): Promise<void> {
   api.registerFlag(OUTPUT_DIRECTORY_FLAG, {
     type: "string",
     description: "Private directory for derived OKF compaction knowledge.",
@@ -594,7 +763,7 @@ export default async function okfCompactionExtension(api: OmpExtensionApi): Prom
     if (marker.kind === "invalid") return { cancel: true, reason: INVALID_MARKER_REASON };
 
     try {
-      await persistConcept(state.outputDirectory, marker.content, timestamp, event.signal);
+      await persistConcept(state.outputDirectory, marker.content, timestamp, event.signal, durability);
     } catch {
       safeLog("derived knowledge write failed");
       throw new Error(PERSISTENCE_FAILURE_REASON);

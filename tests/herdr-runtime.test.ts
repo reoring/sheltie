@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { PongResult, HerdrClient } from "../src/herdr-client.ts";
+import { HerdrApiError, type PongResult, type HerdrClient } from "../src/herdr-client.ts";
 import {
   BundledHerdrRuntime,
   controlledHerdrEnvironment,
@@ -54,6 +54,25 @@ function pong(): PongResult {
   return { type: "pong", version: "0.8.0", protocol: 20, capabilities: null };
 }
 
+function socketError(code: string): Error & { code: string } {
+  return Object.assign(new Error(`socket failed with ${code}`), { code });
+}
+
+const indeterminatePingFailures = [
+  { name: "times out", create: () => new Error("ping timed out after 1000ms") },
+  { name: "fails generically", create: () => new Error("unexpected ping failure") },
+  { name: "is denied", create: () => socketError("EACCES") },
+  { name: "returns a non-Error ENOENT object", create: () => ({ code: "ENOENT" }) },
+  {
+    name: "returns a server ENOENT API error",
+    create: () => new HerdrApiError("ENOENT", "server-provided failure", "request-enoent"),
+  },
+  {
+    name: "returns a server ECONNREFUSED API error",
+    create: () => new HerdrApiError("ECONNREFUSED", "server-provided failure", "request-econnrefused"),
+  },
+];
+
 describe("bundled Herdr runtime", () => {
   test("removes inherited Herdr routing state, replaces the OMP binding, and prefixes only the bundled runtime", () => {
     const environment = controlledHerdrEnvironment(bundledBinding(), {
@@ -86,7 +105,9 @@ describe("bundled Herdr runtime", () => {
       environment: { PATH: "/ambient/bin", HERDR_SOCKET_PATH: "/foreign.sock" },
       createClient: () => clientFor(async () => {
         pingCalls += 1;
-        if (pingCalls < 3) throw new Error("not ready");
+        if (pingCalls < 3) {
+          throw socketError(pingCalls === 1 ? "ENOENT" : "ECONNREFUSED");
+        }
         return pong();
       }),
       spawn: (input) => {
@@ -143,7 +164,7 @@ describe("bundled Herdr runtime", () => {
     let spawns = 0;
     const runtime = new BundledHerdrRuntime(bundledBinding(), {
       createClient: () => clientFor(async () => {
-        throw new Error("not ready");
+        throw socketError("ENOENT");
       }),
       spawn: () => {
         spawns += 1;
@@ -166,7 +187,7 @@ describe("bundled Herdr runtime", () => {
     const exit = Promise.withResolvers<number>();
     const runtime = new BundledHerdrRuntime(bundledBinding(), {
       createClient: () => clientFor(async () => {
-        throw new Error("not ready");
+        throw socketError("ENOENT");
       }),
       spawn: () => ({
         exited: exit.promise,
@@ -218,7 +239,7 @@ describe("bundled Herdr runtime", () => {
     const runtime = new BundledHerdrRuntime(bundledBinding(), {
       environment: {},
       createClient: () => clientFor(async () => {
-        if (!running) throw new Error("socket removed");
+        if (!running) throw socketError("ENOENT");
         return pong();
       }),
       run: async (input) => {
@@ -242,6 +263,58 @@ describe("bundled Herdr runtime", () => {
       }),
     ]);
   });
+
+  for (const { name, create } of indeterminatePingFailures) {
+    test(`does not mutate lifecycle state when the socket ping ${name}`, async () => {
+      let spawnCalls = 0;
+      let commandCalls = 0;
+      const runtime = new BundledHerdrRuntime(bundledBinding(), {
+        createClient: () => clientFor(async () => {
+          throw create();
+        }),
+        spawn: () => {
+          spawnCalls += 1;
+          throw new Error("must not spawn when ping state is indeterminate");
+        },
+        run: async () => {
+          commandCalls += 1;
+          throw new Error("must not stop when ping state is indeterminate");
+        },
+      });
+
+      await expect(runtime.ensureRunning()).rejects.toThrow("cannot determine exact bundled Herdr session state");
+      await expect(runtime.stop()).rejects.toThrow("check the session socket, server health, and permissions");
+
+      expect(spawnCalls).toBe(0);
+      expect(commandCalls).toBe(0);
+    });
+  }
+  test("recognizes Node socket errno failures as stopped without lifecycle mutation", async () => {
+    for (const code of ["ENOENT", "ECONNREFUSED"]) {
+      let spawnCalls = 0;
+      let commandCalls = 0;
+      const runtime = new BundledHerdrRuntime(bundledBinding(), {
+        createClient: () => clientFor(async () => {
+          throw socketError(code);
+        }),
+        spawn: () => {
+          spawnCalls += 1;
+          throw new Error("must not spawn when the socket is definitively stopped");
+        },
+        run: async () => {
+          commandCalls += 1;
+          throw new Error("must not issue stop when the socket is definitively stopped");
+        },
+      });
+
+      await expect(runtime.status()).resolves.toMatchObject({ state: "stopped", socketPath: SOCKET_PATH });
+      await expect(runtime.stop()).resolves.toMatchObject({ state: "stopped", socketPath: SOCKET_PATH });
+
+      expect(spawnCalls).toBe(0);
+      expect(commandCalls).toBe(0);
+    }
+  });
+
 
   test("refuses to stop an incompatible socket that it does not own", async () => {
     let commandCalls = 0;

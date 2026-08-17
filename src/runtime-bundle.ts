@@ -19,8 +19,8 @@ import { isRecord } from "./type-guards.ts";
 
 export const RUNTIME_BUNDLE_API_VERSION = "sheltie.dev/runtime-bundle/v1alpha1";
 export const LINUX_X64_RUNTIME_TARGET = "linux-x64" as const;
-export const REQUIRED_V0_HERDR_SOURCE_COMMIT = "7f82d033663ebcf616dcf127ca75b549da9352e4";
-export const REQUIRED_V0_OMP_SOURCE_COMMIT = "66cd13910c0519269332fe31b1f58b16ef2a9da6";
+export const REQUIRED_V0_HERDR_SOURCE_COMMIT = "ea766d5a70d53ad66028d980fb43b5808947ea71";
+export const REQUIRED_V0_OMP_SOURCE_COMMIT = "90fd6477137fc38c5257f11ad13d9b031b39c526";
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const SOURCE_COMMIT_PATTERN = /^[a-f0-9]{40,64}$/;
@@ -28,6 +28,7 @@ const PRIVATE_DIRECTORY_MODE = 0o700;
 const OWNER_ONLY_MODE_MASK = 0o077;
 const GROUP_OR_OTHER_WRITABLE_MODE_MASK = 0o022;
 const EXECUTABLE_MODE_MASK = 0o111;
+const STICKY_DIRECTORY_MODE = 0o1000;
 const UNIX_SOCKET_PATH_MAX_BYTES = 107;
 const RUNTIME_PATH_HASH_LENGTH = 24;
 const SESSION_PATH_HASH_LENGTH = 16;
@@ -215,6 +216,26 @@ function assertTrustedDirectory(path: string, label: string): void {
   }
   if ((details.mode & GROUP_OR_OTHER_WRITABLE_MODE_MASK) !== 0) {
     fail(`${label} grants group or other write access: ${path}`);
+  }
+}
+
+function assertTrustedBundleAncestors(root: string): void {
+  const uid = effectiveUid();
+  for (let ancestor = dirname(root); ; ancestor = dirname(ancestor)) {
+    const details = lstatIfPresent(ancestor);
+    if (details === null) fail(`runtime bundle ancestor is missing: ${ancestor}`);
+    if (details.isSymbolicLink()) fail(`runtime bundle ancestor must not be a symbolic link: ${ancestor}`);
+    if (!details.isDirectory()) fail(`runtime bundle ancestor must be a directory: ${ancestor}`);
+    if (details.uid !== uid && details.uid !== 0) {
+      fail(`runtime bundle ancestor is not owned by the effective uid or root: ${ancestor}`);
+    }
+    if (
+      (details.mode & GROUP_OR_OTHER_WRITABLE_MODE_MASK) !== 0 &&
+      (details.mode & STICKY_DIRECTORY_MODE) === 0
+    ) {
+      fail(`runtime bundle ancestor grants group or other write access without the sticky bit: ${ancestor}`);
+    }
+    if (ancestor === dirname(ancestor)) return;
   }
 }
 
@@ -467,6 +488,7 @@ export function resolveRuntimeBundle(input: ResolveRuntimeBundleInput): RuntimeB
   const sheltieExecutable = requireString(input.sheltieExecutable, "sheltieExecutable");
   const root = realpathSync(resolve(input.runtimeDir ?? dirname(resolve(sheltieExecutable))));
   assertTrustedDirectory(root, "runtime bundle root");
+  assertTrustedBundleAncestors(root);
   const manifestBytes = readTrustedFile(join(root, "runtime-manifest.json"), "runtime manifest");
   const manifest = parseManifestBytes(manifestBytes);
   const sheltie = verifyArtifact(root, manifest.artifacts.sheltie, "Sheltie runtime", true);

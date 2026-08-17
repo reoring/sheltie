@@ -27,10 +27,12 @@ import { requestHash } from "../src/ids.ts";
 
 const roots: string[] = [];
 const runtimeHomes: string[] = [];
+const directoryModes: Array<{ path: string; mode: number }> = [];
 const HERDR_COMMIT = REQUIRED_V0_HERDR_SOURCE_COMMIT;
 const OMP_COMMIT = REQUIRED_V0_OMP_SOURCE_COMMIT;
 
 afterEach(() => {
+  for (const { path, mode } of directoryModes.splice(0).reverse()) chmodSync(path, mode);
   for (const runtimeHome of runtimeHomes.splice(0)) rmSync(runtimeHome, { recursive: true, force: true });
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -39,6 +41,24 @@ function temporaryRoot(prefix: string): string {
   const root = mkdtempSync(join(tmpdir(), prefix));
   roots.push(root);
   return root;
+}
+
+function createBundleBelowAncestor(root: string, name: string, mode: number): string {
+  const ancestor = join(root, name);
+  mkdirSync(ancestor, { mode: 0o700 });
+  directoryModes.push({ path: ancestor, mode: lstatSync(ancestor).mode & 0o7777 });
+  if ((mode & 0o1000) !== 0) {
+    // Bun's chmodSync strips special permission bits.
+    const result = Bun.spawnSync(["/usr/bin/chmod", mode.toString(8), ancestor], {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    if (result.exitCode !== 0) throw new Error(`could not set sticky mode on ${ancestor}`);
+  } else {
+    chmodSync(ancestor, mode);
+  }
+  return createBundle(ancestor);
 }
 
 
@@ -129,6 +149,26 @@ describe("runtime bundle resolution", () => {
     expect(binding.herdr.path).toBe(join(canonicalBundle, "herdr"));
     expect(binding.omp.path).toBe(join(canonicalBundle, "omp"));
     expect(binding.okfCompaction.path).toBe(join(canonicalBundle, "sheltie-okf-compaction.js"));
+  });
+
+  test("accepts private and sticky writable bundle ancestors", () => {
+    const root = temporaryRoot("sheltie-runtime-ancestor-");
+    const privateBundle = createBundleBelowAncestor(root, "private-ancestor", 0o700);
+    const stickyBundle = createBundleBelowAncestor(root, "sticky-ancestor", 0o1777);
+
+    expect(resolveRuntimeBundle({ sheltieExecutable: join(privateBundle, "sheltie") }).root).toBe(privateBundle);
+    expect(resolveRuntimeBundle({ sheltieExecutable: join(stickyBundle, "sheltie") }).root).toBe(stickyBundle);
+  });
+
+  test("rejects non-sticky writable bundle ancestors", () => {
+    const root = temporaryRoot("sheltie-runtime-ancestor-");
+
+    for (const mode of [0o770, 0o777] as const) {
+      const bundle = createBundleBelowAncestor(root, `non-sticky-${mode.toString(8)}`, mode);
+      expect(() => resolveRuntimeBundle({ sheltieExecutable: join(bundle, "sheltie") })).toThrow(
+        "runtime bundle ancestor grants group or other write access without the sticky bit",
+      );
+    }
   });
 
   test("rejects otherwise-valid manifests from non-required fork commits", () => {

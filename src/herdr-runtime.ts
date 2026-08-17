@@ -1,6 +1,6 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, type Stats } from "node:fs";
 import { dirname, join } from "node:path";
-import { HerdrClient, type PongResult } from "./herdr-client.ts";
+import { HerdrApiError, HerdrClient, type PongResult } from "./herdr-client.ts";
 import { parseRuntimeBinding, type BundledRuntimeBinding } from "./runtime-bundle.ts";
 
 const REQUIRED_HERDR_VERSION = "0.8.0";
@@ -83,6 +83,15 @@ export interface BundledHerdrAttachInput {
 
 function runtimeFailure(message: string): never {
   throw new Error(`bundled Herdr runtime failed: ${message}`);
+}
+
+function isDefinitiveStoppedSocketFailure(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    !(error instanceof HerdrApiError) &&
+    "code" in error &&
+    (error.code === "ENOENT" || error.code === "ECONNREFUSED")
+  );
 }
 
 function lstatIfPresent(path: string): Stats | null {
@@ -368,7 +377,12 @@ export class BundledHerdrRuntime {
     try {
       const pong = await this.createClient(this.binding.socketPath, timeoutMs).ping();
       return this.statusFromPong(pong);
-    } catch {
+    } catch (error: unknown) {
+      if (!isDefinitiveStoppedSocketFailure(error)) {
+        runtimeFailure(
+          "cannot determine exact bundled Herdr session state from socket ping; check the session socket, server health, and permissions before retrying",
+        );
+      }
       return {
         state: "stopped",
         sessionName: this.binding.sessionName,
