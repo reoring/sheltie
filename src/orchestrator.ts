@@ -99,6 +99,7 @@ export interface OrchestratorOptions {
   sheltieExecutable: string;
   agentKind?: string;
   worktreeRoot?: string;
+  workspaceEnvironment?: Record<string, string>;
   maxDepth?: number;
   maxChildren?: number;
   maxDescendants?: number;
@@ -145,6 +146,13 @@ function resultChildNodeId(operation: OperationRecord): string | null {
   if (operation.result === null || typeof operation.result !== "object") return null;
   const childNodeId = (operation.result as Record<string, unknown>).childNodeId;
   return typeof childNodeId === "string" ? childNodeId : null;
+}
+
+function requestWithRuntimeBinding<T extends Record<string, unknown>>(
+  tree: TreeRecord,
+  request: T,
+): T | (T & { runtimeBinding: TreeRecord["runtimeBinding"] }) {
+  return tree.runtimeBinding.mode === "external" ? request : { ...request, runtimeBinding: tree.runtimeBinding };
 }
 
 export class SheltieOrchestrator {
@@ -289,7 +297,7 @@ export class SheltieOrchestrator {
         node.parentNodeId === null && node.worktreePath === tree.repoRoot
           ? await this.provisionRootWorkspace(node, tree)
           : node.placement === "tab"
-            ? await this.provisionTabRuntime(node)
+            ? await this.provisionTabRuntime(node, tree)
             : await this.provisionWorkspaceRuntime(node, tree);
     }
 
@@ -329,14 +337,15 @@ export class SheltieOrchestrator {
             ],
         timeout_ms: 60_000,
       };
+      const operationRequest = requestWithRuntimeBinding(tree, request);
       const operation = this.store.reserveOperation({
         operationId: operationIdForRequest(node.treeId, "agent_start", node.nodeId),
         treeId: node.treeId,
         nodeId: node.nodeId,
         kind: "agent_start",
         requestKey: node.nodeId,
-        requestHash: requestHash(request),
-        request,
+        requestHash: requestHash(operationRequest),
+        request: operationRequest,
       });
       if (operation.status !== "completed") {
         this.store.setOperationStatus(operation.operationId, "submitted", { incrementAttempt: true });
@@ -369,16 +378,21 @@ export class SheltieOrchestrator {
       cwd: tree.repoRoot,
       focus: false,
       label: rootWorkspaceLabel(node.nodeId),
-      env: { SHELTIE_RUN_ID: tree.runId, SHELTIE_NODE_ID: node.nodeId },
+      env: {
+        ...this.options.workspaceEnvironment,
+        SHELTIE_RUN_ID: tree.runId,
+        SHELTIE_NODE_ID: node.nodeId,
+      },
     };
+    const operationRequest = requestWithRuntimeBinding(tree, request);
     let operation = this.store.reserveOperation({
       operationId: operationIdForRequest(node.treeId, "workspace_create", node.nodeId),
       treeId: node.treeId,
       nodeId: node.nodeId,
       kind: "workspace_create",
       requestKey: node.nodeId,
-      requestHash: requestHash(request),
-      request,
+      requestHash: requestHash(operationRequest),
+      request: operationRequest,
     });
     if (operation.status === "completed") return this.reconcileNode(node.nodeId);
     if (operation.status !== "reserved") return this.reconcileNode(node.nodeId);
@@ -416,14 +430,15 @@ export class SheltieOrchestrator {
       label: node.name,
       focus: false,
     };
+    const operationRequest = requestWithRuntimeBinding(tree, request);
     let operation = this.store.reserveOperation({
       operationId: operationIdForRequest(node.treeId, "worktree_create", node.nodeId),
       treeId: node.treeId,
       nodeId: node.nodeId,
       kind: "worktree_create",
       requestKey: node.nodeId,
-      requestHash: requestHash(request),
-      request,
+      requestHash: requestHash(operationRequest),
+      request: operationRequest,
     });
     if (operation.status === "completed") return this.reconcileNode(node.nodeId);
     if (operation.status !== "reserved") return this.reconcileNode(node.nodeId);
@@ -447,7 +462,7 @@ export class SheltieOrchestrator {
     }
   }
 
-  private async provisionTabRuntime(node: NodeRecord): Promise<NodeRecord> {
+  private async provisionTabRuntime(node: NodeRecord, tree: TreeRecord): Promise<NodeRecord> {
     if (node.parentNodeId === null) throw new Error(`tab node ${node.nodeId} has no parent`);
     const parent = this.store.getNode(node.parentNodeId);
     if (parent.workspaceId === null) {
@@ -459,18 +474,21 @@ export class SheltieOrchestrator {
       focus: false,
       label: tabLabelForNode(node),
       env: {
+        ...this.options.workspaceEnvironment,
+        SHELTIE_RUN_ID: tree.runId,
         SHELTIE_NODE_ID: node.nodeId,
         SHELTIE_PARENT_NODE_ID: parent.nodeId,
       },
     };
+    const operationRequest = requestWithRuntimeBinding(tree, request);
     let operation = this.store.reserveOperation({
       operationId: operationIdForRequest(node.treeId, "tab_create", node.nodeId),
       treeId: node.treeId,
       nodeId: node.nodeId,
       kind: "tab_create",
       requestKey: node.nodeId,
-      requestHash: requestHash(request),
-      request,
+      requestHash: requestHash(operationRequest),
+      request: operationRequest,
     });
     if (operation.status === "completed") return this.reconcileNode(node.nodeId);
     if (operation.status !== "reserved") return this.reconcileNode(node.nodeId);
@@ -737,14 +755,16 @@ export class SheltieOrchestrator {
     const operationId = operationIdForRequest(node.treeId, "prompt", requestKey);
     const prompt = this.buildStepPrompt(node, operationId, taskContract);
     const promptSha256 = requestHash(prompt);
+    const request = { promptSha256, target: node.agentName };
+    const operationRequest = requestWithRuntimeBinding(tree, request);
     let operation = this.store.reserveOperation({
       operationId,
       treeId: node.treeId,
       nodeId: node.nodeId,
       kind: "prompt",
       requestKey,
-      requestHash: requestHash({ promptSha256, target: node.agentName }),
-      request: { promptSha256, target: node.agentName },
+      requestHash: requestHash(operationRequest),
+      request: operationRequest,
     });
     if (
       operation.status !== "reserved" &&

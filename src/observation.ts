@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { requestHash } from "./ids.ts";
+import { parseResolvedManifest } from "./manifest.ts";
 import { assertPrivateStateDirectory } from "./state-security.ts";
 import { isRecord } from "./type-guards.ts";
 
@@ -447,7 +448,7 @@ function parseManifest(resolvedJson: string, digest: string, apiVersion: string)
   const name = requireName(requireField(metadata, "name", "stored manifest.metadata"), "stored manifest.metadata.name");
 
   const spec = requireRecord(requireField(manifest, "spec", "stored manifest"), "stored manifest.spec");
-  assertExactKeys(spec, ["root", "limits", "roles"], "stored manifest.spec");
+  assertKnownKeys(spec, ["root", "limits", "roles", "knowledge"], "stored manifest.spec");
   const root = requireRecord(requireField(spec, "root", "stored manifest.spec"), "stored manifest.spec.root");
   assertExactKeys(root, ["role", "name"], "stored manifest.spec.root");
   const rootRole = requireName(requireField(root, "role", "stored manifest.spec.root"), "stored manifest.spec.root.role");
@@ -475,6 +476,13 @@ function parseManifest(resolvedJson: string, digest: string, apiVersion: string)
   };
 
   const rawRoles = requireRecord(requireField(spec, "roles", "stored manifest.spec"), "stored manifest.spec.roles");
+  if (Object.hasOwn(spec, "knowledge")) {
+    try {
+      parseResolvedManifest(manifest);
+    } catch (error) {
+      fail(error instanceof Error ? error.message : "stored manifest knowledge is malformed");
+    }
+  }
   const roleNames = Object.keys(rawRoles).sort();
   if (roleNames.length === 0 || roleNames.length > 128) fail("stored manifest has an invalid role set");
   const roles = new Map<string, ObservationRole>();

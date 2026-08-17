@@ -314,7 +314,7 @@ describe("real run lifecycle", () => {
     store.close();
   });
 
-  test("migrates pre-placement run state and permits tab nodes to share workspace paths", () => {
+  test("migrates pre-placement run state to an external runtime binding and permits tab nodes to share workspace paths", () => {
     const root = mkdtempSync(join(tmpdir(), "sheltie-db-migration-"));
     roots.push(root);
     const databasePath = join(root, "state.sqlite");
@@ -390,8 +390,9 @@ describe("real run lifecycle", () => {
     legacy.close();
 
     const migrated = new SheltieStore(databasePath);
+    const legacyTree = migrated.getOnlyTree();
 
-    expect(migrated.getOnlyTree().generation).toBe(1);
+    expect(legacyTree).toMatchObject({ generation: 1, runtimeBinding: { mode: "external" } });
     expect(migrated.getNode("node-legacy").placement).toBe("workspace");
     migrated.setTreeStatus("tree-legacy", "active");
     const tab = migrated.reserveChildNode(
@@ -594,7 +595,11 @@ describe("manifest persistence", () => {
         status: "initializing",
       },
     );
-    expect(tree).toMatchObject({ manifestDigest: digest, rootRole: "coordinator" });
+    expect(tree).toMatchObject({
+      manifestDigest: digest,
+      rootRole: "coordinator",
+      runtimeBinding: { mode: "external" },
+    });
     store.reserveNode({
       nodeId: "node-manifest-root",
       treeId: "tree-manifest",
@@ -628,6 +633,53 @@ describe("manifest persistence", () => {
       parameters: { topic: "manifest" },
       resolvedCapabilities: { spawn: { roles: ["team"] } },
     });
+    store.close();
+  });
+
+  test("rolls back a manifest and its runtime binding when the tree reservation conflicts", () => {
+    const store = createStore();
+    seedTree(store);
+    const manifestDigest = "b".repeat(64);
+
+    expect(() =>
+      store.createManifestTree(
+        {
+          manifestDigest,
+          apiVersion: "sheltie.dev/v1alpha1",
+          resolved: { apiVersion: "sheltie.dev/v1alpha1", kind: "Run", spec: { roles: {} } },
+        },
+        {
+          treeId: "tree-conflicting-reservation",
+          runId: "run-1",
+          repoRoot: "/tmp/repo",
+          repoSourceWorkspaceId: null,
+          herdrSocketPath: "/tmp/herdr.sock",
+          herdrVersion: "0.8.0",
+          herdrProtocol: 20,
+          baseCommit: "a".repeat(40),
+          worktreeRoot: "/tmp/worktrees",
+          rootTaskContract: "root task",
+          runtimeBinding: { mode: "external" },
+        },
+      ),
+    ).toThrow();
+
+    expect(store.getManifest(manifestDigest)).toBeNull();
+    expect(store.getTree("tree-1").runtimeBinding).toEqual({ mode: "external" });
+    store.close();
+  });
+
+  test("rejects invalid persisted runtime binding JSON", () => {
+    const store = createStore();
+    seedTree(store);
+    const database = new Database(store.path, { strict: true });
+    try {
+      database.query("UPDATE trees SET runtime_binding_json = ? WHERE tree_id = ?").run("{invalid-json", "tree-1");
+    } finally {
+      database.close();
+    }
+
+    expect(() => store.getTree("tree-1")).toThrow(SyntaxError);
     store.close();
   });
 });

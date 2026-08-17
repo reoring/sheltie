@@ -1,13 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { Stats } from "node:fs";
+import { constants, type Stats } from "node:fs";
 import {
   chmod,
   link,
   lstat,
   mkdir,
+  open,
   readFile,
   unlink,
   writeFile,
+  type FileHandle,
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -19,6 +21,10 @@ const MAX_MARKER_CONTENT_CHARS = 16_384;
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
 const OWNER_ONLY_MODE_MASK = 0o077;
+const MAX_LOCK_ATTEMPTS = 20;
+const LOCK_RETRY_DELAY_MS = 25;
+const INVALID_MARKER_REASON = "okf_marker_invalid";
+const PERSISTENCE_FAILURE_REASON = "okf_persistence_failed";
 const MARKER_INSTRUCTION = [
   "Before automatic context compaction, preserve only durable, portable knowledge.",
   `Return it only inside ${OPEN_MARKER} and ${CLOSE_MARKER}.`,
@@ -40,14 +46,18 @@ interface SessionCompactingEvent {
   type: "session.compacting";
 }
 
-interface SessionCompactEvent {
-  type: "session_compact";
-  fromExtension?: boolean;
-  compactionEntry?: {
-    summary?: unknown;
-    timestamp?: unknown;
-  };
+interface ProposedCompaction {
+  summary?: unknown;
 }
+
+interface SessionCompactionPrecommitEvent {
+  type: "session_compaction_precommit";
+  reason?: unknown;
+  timestamp: unknown;
+  signal?: { aborted: boolean };
+  compaction?: ProposedCompaction;
+}
+
 
 interface AutoCompactionEndEvent {
   type: "auto_compaction_end";
@@ -56,7 +66,7 @@ interface AutoCompactionEndEvent {
 type ExtensionEvent =
   | AutoCompactionStartEvent
   | SessionCompactingEvent
-  | SessionCompactEvent
+  | SessionCompactionPrecommitEvent
   | AutoCompactionEndEvent;
 
 type EventHandler = (event: unknown, context: unknown) => unknown | Promise<unknown>;
@@ -68,9 +78,36 @@ interface OmpExtensionApi {
   on(event: ExtensionEvent["type"], handler: EventHandler): void;
 }
 
+export interface OkfCompactionDurability {
+  syncFile(file: FileHandle, path: string): Promise<void>;
+  syncDirectory(directory: FileHandle, path: string): Promise<void>;
+}
+
+const DEFAULT_DURABILITY: OkfCompactionDurability = {
+  syncFile(file) {
+    return file.sync();
+  },
+  syncDirectory(directory) {
+    return directory.sync();
+  },
+};
+
+
 interface CompactionState {
   activeAutomaticContextFull: boolean;
   outputDirectory: string | undefined;
+}
+
+interface LockOwner {
+  pid: number;
+  processStartToken: string;
+  ownerToken: string;
+}
+
+interface LockFileSnapshot {
+  device: number;
+  inode: number;
+  owner: LockOwner | null;
 }
 
 function isEventOfType<T extends ExtensionEvent["type"]>(
@@ -81,19 +118,25 @@ function isEventOfType<T extends ExtensionEvent["type"]>(
   return event.type === type;
 }
 
-function extractMarkerContent(summary: string): string | null {
+type MarkerExtraction =
+  | { kind: "missing" }
+  | { kind: "invalid" }
+  | { kind: "valid"; content: string };
+
+function extractMarkerContent(summary: string): MarkerExtraction {
   const openAt = summary.indexOf(OPEN_MARKER);
   const closeAt = summary.indexOf(CLOSE_MARKER, openAt + OPEN_MARKER.length);
 
-  if (openAt < 0 || closeAt < 0) return null;
-  if (summary.indexOf(OPEN_MARKER, openAt + OPEN_MARKER.length) >= 0) return null;
-  if (summary.indexOf(CLOSE_MARKER) !== closeAt) return null;
+  if (openAt < 0 && closeAt < 0) return { kind: "missing" };
+  if (openAt < 0 || closeAt < 0) return { kind: "invalid" };
+  if (summary.indexOf(OPEN_MARKER, openAt + OPEN_MARKER.length) >= 0) return { kind: "invalid" };
+  if (summary.indexOf(CLOSE_MARKER) !== closeAt) return { kind: "invalid" };
 
   const content = summary.slice(openAt + OPEN_MARKER.length, closeAt).trim();
-  if (content.length === 0 || content.length > MAX_MARKER_CONTENT_CHARS) return null;
-  if (containsUnsafeContent(content)) return null;
+  if (content.length === 0 || content.length > MAX_MARKER_CONTENT_CHARS) return { kind: "invalid" };
+  if (containsUnsafeContent(content)) return { kind: "invalid" };
 
-  return content;
+  return { kind: "valid", content };
 }
 
 function containsUnsafeContent(content: string): boolean {
@@ -197,8 +240,249 @@ function currentEffectiveUid(): number {
   return process.geteuid();
 }
 
-async function ensurePrivateDirectory(path: string): Promise<string> {
+function parseLinuxProcessStartToken(stat: string): string | null {
+  const commandEnd = stat.lastIndexOf(")");
+  if (commandEnd === -1) return null;
+  const fieldsAfterCommand = stat.slice(commandEnd + 1).trim().split(/\s+/);
+  const startToken = fieldsAfterCommand[19];
+  return startToken !== undefined && /^\d+$/.test(startToken) ? startToken : null;
+}
+
+async function readProcessStartToken(pid: number): Promise<string | null | undefined> {
+  if (process.platform !== "linux") return undefined;
+  try {
+    return parseLinuxProcessStartToken(await readFile(`/proc/${pid}/stat`, "utf8")) ?? undefined;
+  } catch (error) {
+    if (errnoCode(error) === "ENOENT") return null;
+    return undefined;
+  }
+}
+
+function parseLockOwner(contents: string): LockOwner | null {
+  try {
+    const value = JSON.parse(contents) as unknown;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).sort();
+    if (keys.join(",") !== "ownerToken,pid,processStartToken") return null;
+    if (typeof record.pid !== "number" || !Number.isSafeInteger(record.pid) || record.pid <= 0) return null;
+    if (typeof record.processStartToken !== "string" || !/^\d+$/.test(record.processStartToken)) return null;
+    if (typeof record.ownerToken !== "string" || !/^[a-f0-9-]{36}$/.test(record.ownerToken)) return null;
+    return {
+      pid: record.pid,
+      processStartToken: record.processStartToken,
+      ownerToken: record.ownerToken,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sameLockOwner(left: LockOwner | null, right: LockOwner | null): boolean {
+  return (
+    left !== null &&
+    right !== null &&
+    left.pid === right.pid &&
+    left.processStartToken === right.processStartToken &&
+    left.ownerToken === right.ownerToken
+  );
+}
+
+async function readPrivateLock(path: string): Promise<LockFileSnapshot | null> {
+  let lock: FileHandle;
+  try {
+    lock = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (errnoCode(error) === "ENOENT") return null;
+    if (errnoCode(error) === "ELOOP") throw new Error("OKF output lock must not be a symbolic link");
+    throw error;
+  }
+  try {
+    const details = await lock.stat();
+    if (!details.isFile()) throw new Error("OKF output lock is not a regular file");
+    if (details.uid !== currentEffectiveUid()) {
+      throw new Error("OKF output lock is not owned by the effective user");
+    }
+    if ((details.mode & OWNER_ONLY_MODE_MASK) !== 0) {
+      throw new Error("OKF output lock is accessible to another user");
+    }
+    return {
+      device: details.dev,
+      inode: details.ino,
+      owner: parseLockOwner(await lock.readFile("utf8")),
+    };
+  } finally {
+    await lock.close();
+  }
+}
+
+async function unlinkLockIfUnchanged(path: string, expected: LockFileSnapshot): Promise<boolean> {
+  const current = await readPrivateLock(path);
+  if (current === null) return true;
+  if (
+    current.device !== expected.device ||
+    current.inode !== expected.inode ||
+    !sameLockOwner(current.owner, expected.owner)
+  ) {
+    return false;
+  }
+  try {
+    await unlink(path);
+    return true;
+  } catch (error) {
+    if (errnoCode(error) === "ENOENT") return true;
+    throw error;
+  }
+}
+
+async function createLockNoOverwrite(
+  path: string,
+  owner: LockOwner,
+  durability: OkfCompactionDurability,
+): Promise<LockFileSnapshot> {
+  const temporaryPath = await writePrivateTemporaryFile(path, `${JSON.stringify(owner)}\n`, durability);
+  let linked = false;
+  try {
+    await link(temporaryPath, path);
+    linked = true;
+    await syncPrivateDirectory(dirname(path), durability);
+  } catch (error) {
+    if (linked) {
+      try {
+        await unlink(path);
+      } catch (cleanupError) {
+        if (errnoCode(cleanupError) !== "ENOENT") throw cleanupError;
+      }
+    }
+    throw error;
+  } finally {
+    try {
+      await unlink(temporaryPath);
+    } catch (error) {
+      if (errnoCode(error) !== "ENOENT") throw error;
+    }
+  }
+  const created = await readPrivateLock(path);
+  if (created === null || !sameLockOwner(created.owner, owner)) {
+    throw new Error("OKF output lock identity changed during acquisition");
+  }
+  return created;
+}
+
+async function lockOwnerLiveness(owner: LockOwner): Promise<"live" | "stale" | "unknown"> {
+  const currentStartToken = await readProcessStartToken(owner.pid);
+  if (currentStartToken === undefined) return "unknown";
+  if (currentStartToken === null || currentStartToken !== owner.processStartToken) return "stale";
+  return "live";
+}
+
+function directoryPathChain(path: string): string[] {
+  const paths: string[] = [];
+  let current = resolve(path);
+  for (;;) {
+    const parent = dirname(current);
+    if (parent === current) break;
+    paths.push(current);
+    current = parent;
+  }
+  return paths.reverse();
+}
+
+async function openPrivateRegularFileNoFollow(path: string): Promise<FileHandle> {
+  let file: FileHandle;
+  try {
+    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (errnoCode(error) === "ELOOP") throw new Error("OKF artifact must not be a symbolic link");
+    throw error;
+  }
+
+  try {
+    const details = await file.stat();
+    if (!details.isFile()) throw new Error("OKF artifact is not a regular file");
+    if (details.uid !== currentEffectiveUid()) {
+      throw new Error("OKF artifact is not owned by the effective user");
+    }
+    if ((details.mode & OWNER_ONLY_MODE_MASK) !== 0) {
+      throw new Error("OKF artifact is accessible to another user");
+    }
+    return file;
+  } catch (error) {
+    try {
+      await file.close();
+    } catch {
+      // The validation error already fails closed.
+    }
+    throw error;
+  }
+}
+
+async function openDirectoryNoFollow(path: string): Promise<FileHandle> {
+  let directory: FileHandle;
+  try {
+    directory = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (errnoCode(error) === "ELOOP") throw new Error("OKF output directory must not be a symbolic link");
+    throw error;
+  }
+
+  try {
+    if (!(await directory.stat()).isDirectory()) {
+      throw new Error("OKF output location is not a real directory");
+    }
+    return directory;
+  } catch (error) {
+    try {
+      await directory.close();
+    } catch {
+      // The validation error already fails closed.
+    }
+    throw error;
+  }
+}
+
+async function syncPrivateRegularFile(path: string, durability: OkfCompactionDurability): Promise<void> {
+  const file = await openPrivateRegularFileNoFollow(path);
+  try {
+    await durability.syncFile(file, path);
+  } finally {
+    await file.close();
+  }
+}
+
+async function syncPrivateDirectory(path: string, durability: OkfCompactionDurability): Promise<void> {
+  const directory = await openDirectoryNoFollow(path);
+  try {
+    await durability.syncDirectory(directory, path);
+  } finally {
+    await directory.close();
+  }
+}
+
+async function verifyAndSyncExistingArtifact(
+  path: string,
+  durability: OkfCompactionDurability,
+  verify: (contents: Buffer) => void,
+): Promise<void> {
+  const file = await openPrivateRegularFileNoFollow(path);
+  try {
+    verify(await file.readFile());
+    await durability.syncFile(file, path);
+  } finally {
+    await file.close();
+  }
+  await syncPrivateDirectory(dirname(path), durability);
+}
+
+async function ensurePrivateDirectory(
+  path: string,
+  durability: OkfCompactionDurability,
+): Promise<string> {
   const resolvedPath = resolve(path);
+  const missingDirectories: string[] = [];
+  for (const candidate of directoryPathChain(resolvedPath)) {
+    if ((await lstatIfPresent(candidate)) === null) missingDirectories.push(candidate);
+  }
   await mkdir(resolvedPath, { recursive: true, mode: DIRECTORY_MODE });
 
   const details = await lstat(resolvedPath);
@@ -214,6 +498,13 @@ async function ensurePrivateDirectory(path: string): Promise<string> {
   const securedDetails = await lstat(resolvedPath);
   if ((securedDetails.mode & OWNER_ONLY_MODE_MASK) !== 0) {
     throw new Error("OKF output directory is accessible to another user");
+  }
+
+  if (missingDirectories.length > 0) {
+    for (const createdDirectory of [...missingDirectories].reverse()) {
+      await syncPrivateDirectory(createdDirectory, durability);
+    }
+    await syncPrivateDirectory(dirname(missingDirectories[0]!), durability);
   }
 
   return resolvedPath;
@@ -235,10 +526,58 @@ async function ensurePrivateRegularFile(path: string): Promise<boolean> {
 
   return true;
 }
+async function acquireExclusiveLock(
+  outputDirectory: string,
+  durability: OkfCompactionDurability,
+): Promise<() => Promise<void>> {
+  const lockPath = join(outputDirectory, ".okf-compaction.lock");
+  const processStartToken = await readProcessStartToken(process.pid);
+  if (processStartToken === null || processStartToken === undefined) {
+    throw new Error("current process start identity is unavailable");
+  }
+  const owner: LockOwner = {
+    pid: process.pid,
+    processStartToken,
+    ownerToken: randomUUID(),
+  };
+
+  for (let attempt = 0; attempt < MAX_LOCK_ATTEMPTS; attempt += 1) {
+    try {
+      const acquired = await createLockNoOverwrite(lockPath, owner, durability);
+      return async () => {
+        const current = await readPrivateLock(lockPath);
+        if (current === null || !sameLockOwner(current.owner, owner)) return;
+        await unlinkLockIfUnchanged(lockPath, acquired);
+      };
+    } catch (error) {
+      if (errnoCode(error) !== "EEXIST") throw error;
+      const existing = await readPrivateLock(lockPath);
+      if (
+        existing !== null &&
+        existing.owner !== null &&
+        (await lockOwnerLiveness(existing.owner)) === "stale" &&
+        (await unlinkLockIfUnchanged(lockPath, existing))
+      ) {
+        continue;
+      }
+      if (attempt === MAX_LOCK_ATTEMPTS - 1) throw error;
+      const delay = Promise.withResolvers<void>();
+      setTimeout(delay.resolve, LOCK_RETRY_DELAY_MS);
+      await delay.promise;
+    }
+  }
+
+  throw new Error("OKF output lock could not be acquired");
+}
+
 
 let temporaryFileSequence = 0;
 
-async function writePrivateTemporaryFile(path: string, contents: string): Promise<string> {
+async function writePrivateTemporaryFile(
+  path: string,
+  contents: string,
+  durability: OkfCompactionDurability,
+): Promise<string> {
   const directory = dirname(path);
   const baseName = basename(path);
 
@@ -257,6 +596,7 @@ async function writePrivateTemporaryFile(path: string, contents: string): Promis
 
     try {
       await chmod(temporaryPath, FILE_MODE);
+      await syncPrivateRegularFile(temporaryPath, durability);
       return temporaryPath;
     } catch (error) {
       try {
@@ -269,13 +609,18 @@ async function writePrivateTemporaryFile(path: string, contents: string): Promis
   }
 }
 
-async function publishNoOverwrite(path: string, contents: string): Promise<void> {
-  const temporaryPath = await writePrivateTemporaryFile(path, contents);
+async function publishNoOverwrite(
+  path: string,
+  contents: string,
+  durability: OkfCompactionDurability,
+): Promise<void> {
+  const temporaryPath = await writePrivateTemporaryFile(path, contents, durability);
 
   try {
     try {
       await link(temporaryPath, path);
       await ensurePrivateRegularFile(path);
+      await syncPrivateDirectory(dirname(path), durability);
       return;
     } catch (error) {
       if (errnoCode(error) !== "EEXIST") throw error;
@@ -285,10 +630,11 @@ async function publishNoOverwrite(path: string, contents: string): Promise<void>
       throw new Error("OKF artifact disappeared while publishing");
     }
 
-    const existingContents = await readFile(path);
-    if (!existingContents.equals(Buffer.from(contents, "utf8"))) {
-      throw new Error("OKF artifact conflicts with an existing file");
-    }
+    await verifyAndSyncExistingArtifact(path, durability, (existingContents) => {
+      if (!existingContents.equals(Buffer.from(contents, "utf8"))) {
+        throw new Error("OKF artifact conflicts with an existing file");
+      }
+    });
   } finally {
     try {
       await unlink(temporaryPath);
@@ -298,15 +644,60 @@ async function publishNoOverwrite(path: string, contents: string): Promise<void>
   }
 }
 
-async function persistConcept(outputDirectory: string, content: string, timestamp: string): Promise<void> {
-  const privateOutputDirectory = await ensurePrivateDirectory(outputDirectory);
-  const conceptsDirectory = await ensurePrivateDirectory(join(privateOutputDirectory, "concepts"));
-  const digest = conceptDigest(content);
-  const conceptName = `compaction-${digest}.md`;
-  const conceptPath = join(conceptsDirectory, conceptName);
+async function publishConceptNoOverwrite(
+  path: string,
+  content: string,
+  digest: string,
+  timestamp: string,
+  durability: OkfCompactionDurability,
+): Promise<void> {
+  if (!(await ensurePrivateRegularFile(path))) {
+    await publishNoOverwrite(path, createConceptMarkdown(content, digest, timestamp), durability);
+    return;
+  }
 
-  await publishNoOverwrite(conceptPath, createConceptMarkdown(content, digest, timestamp));
-  await publishNoOverwrite(join(privateOutputDirectory, "index.md"), createIndexMarkdown());
+  await verifyAndSyncExistingArtifact(path, durability, (existingContents) => {
+    const existingMarkdown = existingContents.toString("utf8");
+    const existingTimestamp = eventTimestamp(existingMarkdown.match(/^  at:\s*(.+)$/m)?.[1]);
+    if (
+      existingTimestamp === null ||
+      !existingContents.equals(
+        Buffer.from(createConceptMarkdown(content, digest, existingTimestamp), "utf8"),
+      )
+    ) {
+      throw new Error("OKF artifact conflicts with an existing file");
+    }
+  });
+}
+
+async function persistConcept(
+  outputDirectory: string,
+  content: string,
+  timestamp: string,
+  signal: { aborted: boolean } | undefined,
+  durability: OkfCompactionDurability,
+): Promise<void> {
+  if (signal?.aborted) throw new Error("OKF precommit was cancelled");
+
+  const privateOutputDirectory = await ensurePrivateDirectory(outputDirectory, durability);
+  const releaseLock = await acquireExclusiveLock(privateOutputDirectory, durability);
+
+  try {
+    if (signal?.aborted) throw new Error("OKF precommit was cancelled");
+
+    const conceptsDirectory = await ensurePrivateDirectory(
+      join(privateOutputDirectory, "concepts"),
+      durability,
+    );
+    const digest = conceptDigest(content);
+    const conceptName = `compaction-${digest}.md`;
+    const conceptPath = join(conceptsDirectory, conceptName);
+
+    await publishConceptNoOverwrite(conceptPath, content, digest, timestamp, durability);
+    await publishNoOverwrite(join(privateOutputDirectory, "index.md"), createIndexMarkdown(), durability);
+  } finally {
+    await releaseLock();
+  }
 }
 
 function safeLog(message: string): void {
@@ -317,7 +708,10 @@ function safeLog(message: string): void {
   }
 }
 
-export default async function okfCompactionExtension(api: OmpExtensionApi): Promise<void> {
+export default async function okfCompactionExtension(
+  api: OmpExtensionApi,
+  durability: OkfCompactionDurability = DEFAULT_DURABILITY,
+): Promise<void> {
   api.registerFlag(OUTPUT_DIRECTORY_FLAG, {
     type: "string",
     description: "Private directory for derived OKF compaction knowledge.",
@@ -349,29 +743,33 @@ export default async function okfCompactionExtension(api: OmpExtensionApi): Prom
     return { context: [MARKER_INSTRUCTION] };
   });
 
-  api.on("session_compact", async (event) => {
+  api.on("session_compaction_precommit", async (event) => {
     if (
       !state.activeAutomaticContextFull ||
       state.outputDirectory === undefined ||
-      !isEventOfType(event, "session_compact") ||
-      event.fromExtension === true
+      !isEventOfType(event, "session_compaction_precommit")
     ) {
       return;
     }
 
-    const summary = event.compactionEntry?.summary;
-    const timestamp = eventTimestamp(event.compactionEntry?.timestamp);
-    if (typeof summary !== "string" || timestamp === null) return;
+    if (event.signal?.aborted) throw new Error(PERSISTENCE_FAILURE_REASON);
 
-    const content = extractMarkerContent(summary);
-    if (content === null) return;
+    const summary = event.compaction?.summary;
+    const timestamp = eventTimestamp(event.timestamp);
+    if (typeof summary !== "string" || timestamp === null) throw new Error(PERSISTENCE_FAILURE_REASON);
+
+    const marker = extractMarkerContent(summary);
+    if (marker.kind === "missing") return;
+    if (marker.kind === "invalid") return { cancel: true, reason: INVALID_MARKER_REASON };
 
     try {
-      await persistConcept(state.outputDirectory, content, timestamp);
+      await persistConcept(state.outputDirectory, marker.content, timestamp, event.signal, durability);
     } catch {
-      safeLog("derived knowledge write skipped");
+      safeLog("derived knowledge write failed");
+      throw new Error(PERSISTENCE_FAILURE_REASON);
     }
   });
+
 
   api.on("auto_compaction_end", (event) => {
     if (!isEventOfType(event, "auto_compaction_end")) return;
